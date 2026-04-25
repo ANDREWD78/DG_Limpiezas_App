@@ -1,6 +1,6 @@
 'use strict';
 const router = require('express').Router();
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
 const sheets = require('../services/sheets');
 const telegram = require('../services/telegram');
 const { createClient } = require('@supabase/supabase-js');
@@ -284,6 +284,200 @@ router.get('/catalogo', requireAuth, async (req, res, next) => {
     } catch (err) {
         next(err);
     }
+});
+
+// ─── Admin: gestión del catálogo ────────────────────────────────────────────
+
+const CASAS_VALIDAS = ['ALL', 'MIRADOR', 'CASON', 'GRATAL'];
+
+// GET /api/consumibles/catalogo-admin — listado completo (admin)
+router.get('/catalogo-admin', requireAuth, requireAdmin, async (req, res, next) => {
+    try {
+        if (!supabase) {
+            console.error('[SUPABASE][CATALOGO] Cliente no inicializado en GET catalogo-admin');
+            return res.status(500).json({ error: 'Base de datos no disponible' });
+        }
+
+        const { data, error } = await supabase
+            .from('consumibles_catalogo')
+            .select('id, casa, nombre, activo, orden, created_at, updated_at')
+            .order('casa', { ascending: true })
+            .order('orden', { ascending: true })
+            .order('nombre', { ascending: true });
+
+        if (error) {
+            console.error('[SUPABASE][CATALOGO] ERROR en GET catalogo-admin:', error.message);
+            return res.status(500).json({ error: 'Error leyendo catálogo admin' });
+        }
+
+        res.json(data || []);
+    } catch (err) { next(err); }
+});
+
+// POST /api/consumibles/catalogo — crear producto en catálogo (admin)
+router.post('/catalogo', requireAuth, requireAdmin, async (req, res, next) => {
+    try {
+        if (!supabase) {
+            console.error('[SUPABASE][CATALOGO] Cliente no inicializado en POST catalogo');
+            return res.status(500).json({ error: 'Base de datos no disponible' });
+        }
+
+        const { casa: casaRaw, nombre: nombreRaw, orden: ordenRaw, activo } = req.body;
+
+        // Normalizar casa: string + trim + uppercase
+        const casa = String(casaRaw || '').trim().toUpperCase();
+        if (!CASAS_VALIDAS.includes(casa)) {
+            return res.status(400).json({ error: `casa debe ser uno de: ${CASAS_VALIDAS.join(', ')}` });
+        }
+
+        if (!nombreRaw || !String(nombreRaw).trim()) {
+            return res.status(400).json({ error: 'nombre es obligatorio' });
+        }
+
+        // Normalizar nombre: trim + colapsar espacios + capitalizar primera letra
+        const nombre = String(nombreRaw).trim().replace(/\s+/g, ' ')
+            .replace(/^./, c => c.toUpperCase());
+
+        // Comprobar duplicado case-insensitive contra nombre ya normalizado
+        const { data: existente, error: errCheck } = await supabase
+            .from('consumibles_catalogo')
+            .select('id')
+            .ilike('nombre', nombre)
+            .eq('casa', casa)
+            .maybeSingle();
+
+        if (errCheck) {
+            console.error('[SUPABASE][CATALOGO] ERROR comprobando duplicado:', errCheck.message);
+            return res.status(500).json({ error: 'Error comprobando duplicado' });
+        }
+        if (existente) {
+            return res.status(409).json({ error: 'El producto ya existe para esa casa' });
+        }
+
+        // Orden: acepta número o string numérico; valida entero >= 0
+        let orden;
+        if (ordenRaw !== undefined && ordenRaw !== null && ordenRaw !== '') {
+            const ordenNum = Number(ordenRaw);
+            if (!Number.isInteger(ordenNum) || ordenNum < 0) {
+                return res.status(400).json({ error: 'orden debe ser un número entero mayor o igual que 0' });
+            }
+            orden = ordenNum;
+        } else {
+            const { data: maxRow } = await supabase
+                .from('consumibles_catalogo')
+                .select('orden')
+                .eq('casa', casa)
+                .order('orden', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            orden = (maxRow?.orden ?? 0) + 10;
+        }
+
+        const { data, error } = await supabase
+            .from('consumibles_catalogo')
+            .insert({ casa, nombre, orden, activo: activo !== false })
+            .select();
+
+        if (error) {
+            console.error('[SUPABASE][CATALOGO] ERROR en POST catalogo:', error.message);
+            return res.status(500).json({ error: 'Error creando producto en catálogo' });
+        }
+
+        console.log(`[SUPABASE][CATALOGO] Creado: ${casa} / ${nombre} (orden ${orden})`);
+        res.status(201).json(data[0]);
+    } catch (err) { next(err); }
+});
+
+// PATCH /api/consumibles/catalogo/:id — editar producto del catálogo (admin)
+router.patch('/catalogo/:id', requireAuth, requireAdmin, async (req, res, next) => {
+    try {
+        if (!supabase) {
+            console.error('[SUPABASE][CATALOGO] Cliente no inicializado en PATCH catalogo');
+            return res.status(500).json({ error: 'Base de datos no disponible' });
+        }
+
+        const { id } = req.params;
+        const { casa: casaRaw, nombre: nombreRaw, orden: ordenRaw, activo } = req.body;
+        const payload = {};
+
+        if (casaRaw !== undefined) {
+            const casa = String(casaRaw).trim().toUpperCase();
+            if (!CASAS_VALIDAS.includes(casa)) {
+                return res.status(400).json({ error: `casa debe ser uno de: ${CASAS_VALIDAS.join(', ')}` });
+            }
+            payload.casa = casa;
+        }
+        if (nombreRaw !== undefined) {
+            const nombre = String(nombreRaw).trim().replace(/\s+/g, ' ')
+                .replace(/^./, c => c.toUpperCase());
+            if (!nombre) return res.status(400).json({ error: 'nombre no puede estar vacío' });
+            payload.nombre = nombre;
+        }
+        if (ordenRaw !== undefined) {
+            const ordenNum = Number(ordenRaw);
+            if (!Number.isInteger(ordenNum) || ordenNum < 0) {
+                return res.status(400).json({ error: 'orden debe ser un número entero mayor o igual que 0' });
+            }
+            payload.orden = ordenNum;
+        }
+        if (activo !== undefined) {
+            if (typeof activo !== 'boolean') return res.status(400).json({ error: 'activo debe ser boolean' });
+            payload.activo = activo;
+        }
+
+        if (Object.keys(payload).length === 0) {
+            return res.status(400).json({ error: 'Sin campos para actualizar' });
+        }
+
+        // Comprobar duplicado si cambia nombre o casa (excluir el propio registro)
+        if ('nombre' in payload || 'casa' in payload) {
+            const { data: current, error: errCurrent } = await supabase
+                .from('consumibles_catalogo')
+                .select('nombre, casa')
+                .eq('id', id)
+                .maybeSingle();
+            if (errCurrent) {
+                console.error('[SUPABASE][CATALOGO] ERROR leyendo registro actual en PATCH:', errCurrent.message);
+                return res.status(500).json({ error: 'Error verificando producto' });
+            }
+            if (!current) return res.status(404).json({ error: 'Producto no encontrado' });
+
+            const nombreFinal = payload.nombre ?? current.nombre;
+            const casaFinal = payload.casa ?? current.casa;
+
+            const { data: existente, error: errCheck } = await supabase
+                .from('consumibles_catalogo')
+                .select('id')
+                .ilike('nombre', nombreFinal)
+                .eq('casa', casaFinal)
+                .neq('id', id)
+                .maybeSingle();
+            if (errCheck) {
+                console.error('[SUPABASE][CATALOGO] ERROR comprobando duplicado en PATCH:', errCheck.message);
+                return res.status(500).json({ error: 'Error comprobando duplicado' });
+            }
+            if (existente) {
+                return res.status(409).json({ error: 'El producto ya existe para esa casa' });
+            }
+        }
+
+        const { data, error } = await supabase
+            .from('consumibles_catalogo')
+            .update(payload)
+            .eq('id', id)
+            .select();
+
+        if (error) {
+            console.error('[SUPABASE][CATALOGO] ERROR en PATCH catalogo:', error.message);
+            return res.status(500).json({ error: 'Error actualizando producto del catálogo' });
+        }
+        if (!data || data.length === 0) {
+            return res.status(404).json({ error: 'Producto no encontrado' });
+        }
+
+        console.log(`[SUPABASE][CATALOGO] Actualizado: ${id} → ${JSON.stringify(payload)}`);
+        res.json(data[0]);
+    } catch (err) { next(err); }
 });
 
 module.exports = router;

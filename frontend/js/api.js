@@ -60,6 +60,11 @@ export const api = {
     consumibles: (p = {}) => request('GET', `/api/consumibles?${new URLSearchParams(p)}`),
     updateConsumo: (id, d) => request('PATCH', `/api/consumibles/${id}`, d),
 
+    // Consumibles — Catálogo admin
+    catalogoAdmin: () => request('GET', '/api/consumibles/catalogo-admin'),
+    crearCatalogoItem: (payload) => request('POST', '/api/consumibles/catalogo', payload),
+    actualizarCatalogoItem: (id, payload) => request('PATCH', `/api/consumibles/catalogo/${id}`, payload),
+
     // Consumibles — Propuestas
     crearPropuesta: (data) => request('POST', '/api/propuestas', data),
     propuestas: (p = {}) => request('GET', `/api/propuestas?${new URLSearchParams(p)}`),

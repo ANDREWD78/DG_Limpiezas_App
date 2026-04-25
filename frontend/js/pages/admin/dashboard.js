@@ -1873,8 +1873,9 @@ async function consumibles(el) {
         <div style="flex-grow:1;">
           ${contentHtml}
         </div>
-        <div style="margin-top:24px; margin-bottom:20px;">
+        <div style="margin-top:24px; margin-bottom:20px; display:flex; flex-direction:column; gap:10px;">
           <button id="btn-add-cons-real" class="btn btn-primary" style="width:100%; padding:16px; border-radius:12px; font-size:1rem; font-weight:700; box-shadow:0 4px 12px rgba(59, 130, 246, 0.2);">➕ Registrar consumible</button>
+          <button id="btn-gestionar-catalogo" style="width:100%;padding:10px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--text-muted);font-size:.8rem;font-weight:600;cursor:pointer;">⚙️ Gestionar catálogo</button>
         </div>
       </div>
     `;
@@ -2091,7 +2092,199 @@ async function consumibles(el) {
           }
         };
       });
+
+      el.querySelector('#btn-gestionar-catalogo').addEventListener('click', renderCatalogAdmin);
     };
+
+    function renderCatalogAdmin() {
+      const modal = document.createElement('div');
+      modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;align-items:flex-end;justify-content:center;';
+
+      const fld = 'background:#0b1220;border:1px solid rgba(148,163,184,.35);border-radius:10px;padding:8px 12px;color:#f8fafc;width:100%;font-size:.8rem;height:40px;outline:none;';
+      const chipOn = 'padding:4px 10px;border-radius:16px;font-size:.72rem;font-weight:600;border:1px solid var(--primary);background:var(--primary);color:#fff;cursor:pointer;flex-shrink:0;';
+      const chipOff = 'padding:4px 10px;border-radius:16px;font-size:.72rem;font-weight:600;border:1px solid var(--border);background:transparent;color:var(--text-muted);cursor:pointer;flex-shrink:0;';
+
+      modal.innerHTML = `
+        <div style="background:var(--bg-surface);border-radius:20px 20px 0 0;padding:20px 16px 40px;width:100%;max-width:540px;border-top:1px solid var(--border);max-height:90vh;display:flex;flex-direction:column;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-shrink:0;">
+            <h3 style="margin:0;color:var(--text);font-size:1rem;font-weight:800;">⚙️ Gestionar catálogo</h3>
+            <button id="btn-close-cat-admin" style="background:none;border:none;color:var(--text);font-size:1.5rem;cursor:pointer;">&times;</button>
+          </div>
+
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;flex-shrink:0;" id="cat-casa-filter">
+            <button class="cat-f-btn" data-casa="" style="${chipOn}">Todas</button>
+            <button class="cat-f-btn" data-casa="ALL" style="${chipOff}">ALL</button>
+            <button class="cat-f-btn" data-casa="MIRADOR" style="${chipOff}">MIRADOR</button>
+            <button class="cat-f-btn" data-casa="CASON" style="${chipOff}">CASÓN</button>
+            <button class="cat-f-btn" data-casa="GRATAL" style="${chipOff}">GRATAL</button>
+          </div>
+
+          <div id="cat-admin-list" style="flex:1;overflow-y:auto;margin-bottom:14px;">
+            <div style="display:flex;justify-content:center;padding:24px;"><div class="loading-spinner"></div></div>
+          </div>
+
+          <div style="border-top:1px solid var(--border);padding-top:14px;flex-shrink:0;">
+            <div style="font-size:.75rem;font-weight:700;color:var(--text);margin-bottom:10px;">➕ Nuevo producto</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">
+              <div>
+                <div style="font-size:.65rem;color:var(--text-muted);font-weight:600;margin-bottom:4px;">CASA</div>
+                <select id="cat-new-casa" style="${fld}">
+                  <option value="ALL">ALL (todas)</option>
+                  <option value="MIRADOR">MIRADOR</option>
+                  <option value="CASON">CASÓN</option>
+                  <option value="GRATAL">GRATAL</option>
+                </select>
+              </div>
+              <div>
+                <div style="font-size:.65rem;color:var(--text-muted);font-weight:600;margin-bottom:4px;">ORDEN (opcional)</div>
+                <input type="number" id="cat-new-orden" placeholder="Auto" min="1" style="${fld}">
+              </div>
+            </div>
+            <div style="margin-bottom:8px;">
+              <div style="font-size:.65rem;color:var(--text-muted);font-weight:600;margin-bottom:4px;">NOMBRE</div>
+              <input type="text" id="cat-new-nombre" placeholder="Nombre del producto" style="${fld}">
+            </div>
+            <button id="btn-cat-add" class="btn btn-primary" style="width:100%;padding:12px;border-radius:10px;font-weight:700;font-size:.85rem;">Añadir</button>
+          </div>
+        </div>
+      `;
+
+      document.body.appendChild(modal);
+
+      let catFiltro = '';
+      let catData = [];
+
+      const listEl = modal.querySelector('#cat-admin-list');
+
+      const renderList = () => {
+        const items = catFiltro ? catData.filter(p => p.casa === catFiltro) : catData;
+        if (!items.length) {
+          listEl.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);font-size:.82rem;">Sin productos para este filtro</div>';
+          return;
+        }
+        listEl.innerHTML = items.map(p => `
+          <div class="cat-item-row" data-id="${p.id}" style="display:flex;align-items:center;gap:8px;padding:9px 0;border-bottom:1px solid var(--border);">
+            <div style="flex:1;min-width:0;">
+              <div style="font-size:.84rem;font-weight:600;color:${p.activo ? 'var(--text)' : 'var(--text-muted)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${p.nombre}</div>
+              <div style="display:flex;gap:4px;margin-top:3px;flex-wrap:wrap;">
+                <span style="font-size:.62rem;padding:1px 6px;border-radius:8px;background:rgba(148,163,184,.12);color:var(--text-muted);">${p.casa}</span>
+                <span style="font-size:.62rem;padding:1px 6px;border-radius:8px;background:rgba(148,163,184,.12);color:var(--text-muted);">#${p.orden}</span>
+                <span style="font-size:.62rem;padding:1px 6px;border-radius:8px;background:${p.activo ? 'rgba(34,197,94,.12)' : 'rgba(239,68,68,.12)'};color:${p.activo ? '#22c55e' : '#ef4444'};">${p.activo ? 'Activo' : 'Inactivo'}</span>
+              </div>
+            </div>
+            <button class="cat-edit-btn" data-id="${p.id}" style="padding:4px 8px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text-muted);font-size:.72rem;cursor:pointer;flex-shrink:0;">✏️</button>
+            <button class="cat-toggle-btn" data-id="${p.id}" data-activo="${p.activo}" style="padding:4px 8px;border-radius:8px;border:1px solid ${p.activo ? 'rgba(239,68,68,.4)' : 'rgba(34,197,94,.4)'};background:transparent;color:${p.activo ? '#ef4444' : '#22c55e'};font-size:.7rem;font-weight:600;cursor:pointer;flex-shrink:0;">${p.activo ? 'Desact.' : 'Activar'}</button>
+          </div>
+        `).join('');
+
+        listEl.querySelectorAll('.cat-toggle-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const esActivo = btn.dataset.activo === 'true';
+            btn.disabled = true;
+            try {
+              await api.actualizarCatalogoItem(btn.dataset.id, { activo: !esActivo });
+              toast(esActivo ? 'Producto desactivado' : 'Producto activado ✅', 'success');
+              await loadCatalogAdmin();
+            } catch (e) { toast('Error: ' + e.message, 'error'); btn.disabled = false; }
+          });
+        });
+
+        listEl.querySelectorAll('.cat-edit-btn').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const item = catData.find(p => p.id === btn.dataset.id);
+            if (item) showEditInline(item);
+          });
+        });
+      };
+
+      const loadCatalogAdmin = async () => {
+        listEl.innerHTML = '<div style="display:flex;justify-content:center;padding:20px;"><div class="loading-spinner"></div></div>';
+        try {
+          catData = await api.catalogoAdmin();
+          renderList();
+        } catch (e) {
+          listEl.innerHTML = `<div style="color:#ef4444;font-size:.82rem;padding:12px;">Error: ${e.message}</div>`;
+        }
+      };
+
+      const showEditInline = (item) => {
+        const row = listEl.querySelector(`[data-id="${item.id}"]`);
+        if (!row) return;
+        row.innerHTML = `
+          <div style="width:100%;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+            <input class="cat-ei-nombre" value="${item.nombre}" style="background:#0b1220;border:1px solid var(--primary);border-radius:8px;padding:6px 10px;color:#f8fafc;font-size:.8rem;height:36px;outline:none;grid-column:1/-1;">
+            <select class="cat-ei-casa" style="background:#0b1220;border:1px solid var(--border);border-radius:8px;padding:4px 8px;color:#f8fafc;font-size:.78rem;height:36px;outline:none;">
+              <option value="ALL" ${item.casa==='ALL'?'selected':''}>ALL</option>
+              <option value="MIRADOR" ${item.casa==='MIRADOR'?'selected':''}>MIRADOR</option>
+              <option value="CASON" ${item.casa==='CASON'?'selected':''}>CASÓN</option>
+              <option value="GRATAL" ${item.casa==='GRATAL'?'selected':''}>GRATAL</option>
+            </select>
+            <input type="number" class="cat-ei-orden" value="${item.orden}" min="1" style="background:#0b1220;border:1px solid var(--border);border-radius:8px;padding:6px 10px;color:#f8fafc;font-size:.78rem;height:36px;outline:none;">
+            <div style="display:flex;gap:4px;">
+              <button class="cat-ei-save" style="flex:1;padding:4px;border-radius:8px;background:var(--primary);border:none;color:#fff;font-size:.75rem;font-weight:700;cursor:pointer;">✓ Guardar</button>
+              <button class="cat-ei-cancel" style="flex:1;padding:4px;border-radius:8px;border:1px solid var(--border);background:transparent;color:var(--text-muted);font-size:.75rem;cursor:pointer;">✕</button>
+            </div>
+          </div>
+        `;
+        row.querySelector('.cat-ei-cancel').addEventListener('click', renderList);
+        row.querySelector('.cat-ei-save').addEventListener('click', async () => {
+          const nombre = row.querySelector('.cat-ei-nombre').value.trim();
+          const casa = row.querySelector('.cat-ei-casa').value;
+          const ordenNum = Number(row.querySelector('.cat-ei-orden').value);
+          if (!nombre) { toast('Nombre no puede estar vacío', 'warning'); return; }
+          if (!Number.isInteger(ordenNum) || ordenNum < 0) { toast('Orden debe ser un número entero ≥ 0', 'warning'); return; }
+          const saveBtn = row.querySelector('.cat-ei-save');
+          saveBtn.disabled = true;
+          try {
+            await api.actualizarCatalogoItem(item.id, { nombre, casa, orden: ordenNum });
+            toast('Actualizado ✅', 'success');
+            await loadCatalogAdmin();
+          } catch (e) { toast('Error: ' + e.message, 'error'); saveBtn.disabled = false; }
+        });
+      };
+
+      modal.querySelector('#cat-casa-filter').addEventListener('click', e => {
+        const btn = e.target.closest('.cat-f-btn');
+        if (!btn) return;
+        catFiltro = btn.dataset.casa;
+        modal.querySelectorAll('.cat-f-btn').forEach(b => b.style.cssText = b.dataset.casa === catFiltro ? chipOn : chipOff);
+        renderList();
+      });
+
+      modal.querySelector('#btn-cat-add').addEventListener('click', async () => {
+        const addBtn = modal.querySelector('#btn-cat-add');
+        const casa = modal.querySelector('#cat-new-casa').value;
+        const nombre = modal.querySelector('#cat-new-nombre').value.trim();
+        const ordenVal = modal.querySelector('#cat-new-orden').value;
+        if (!nombre) { toast('Escribe el nombre del producto', 'warning'); modal.querySelector('#cat-new-nombre').focus(); return; }
+        if (ordenVal) {
+          const n = Number(ordenVal);
+          if (!Number.isInteger(n) || n < 0) { toast('Orden debe ser un número entero ≥ 0', 'warning'); return; }
+        }
+        const payload = { casa, nombre };
+        if (ordenVal) payload.orden = Number(ordenVal);
+        addBtn.disabled = true;
+        addBtn.textContent = 'Añadiendo...';
+        try {
+          await api.crearCatalogoItem(payload);
+          modal.querySelector('#cat-new-nombre').value = '';
+          modal.querySelector('#cat-new-orden').value = '';
+          toast('Producto añadido ✅', 'success');
+          await loadCatalogAdmin();
+          modal.querySelector('#cat-new-nombre').focus();
+        } catch (e) {
+          toast('Error: ' + e.message, 'error');
+        } finally {
+          addBtn.disabled = false;
+          addBtn.textContent = 'Añadir';
+        }
+      });
+
+      modal.querySelector('#btn-close-cat-admin').onclick = () => modal.remove();
+      modal.onclick = e => { if (e.target === modal) modal.remove(); };
+
+      loadCatalogAdmin();
+    }
 
     await reloadCons();
   }
