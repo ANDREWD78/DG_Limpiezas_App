@@ -248,11 +248,42 @@ router.patch('/:id', requireAuth, async (req, res, next) => {
 });
 
 // GET /api/consumibles/catalogo?casa=X
-router.get('/catalogo', requireAuth, (req, res) => {
-    const casa = req.query.casa;
-    const lista = [...CONSUMIBLES_BASE];
-    if (casa === 'GRATAL') lista.push(...CONSUMIBLES_GRATAL);
-    res.json(lista.sort());
+router.get('/catalogo', requireAuth, async (req, res, next) => {
+    try {
+        if (!supabase) {
+            console.error('[SUPABASE] Cliente no inicializado en GET catalogo');
+            return res.status(500).json({ error: 'Base de datos no disponible' });
+        }
+
+        const casa = req.query.casa;
+        const casaFilter = casa ? ['ALL', casa] : ['ALL'];
+
+        const { data, error } = await supabase
+            .from('consumibles_catalogo')
+            .select('nombre, orden')
+            .in('casa', casaFilter)
+            .eq('activo', true)
+            .order('orden', { ascending: true })
+            .order('nombre', { ascending: true });
+
+        if (error) {
+            console.error('[SUPABASE] ERROR leyendo catalogo:', error.message);
+            return res.status(500).json({ error: 'Error leyendo catálogo de consumibles' });
+        }
+
+        const seen = new Set();
+        const lista = (data || [])
+            .map(r => r.nombre)
+            .filter(n => {
+                if (seen.has(n)) return false;
+                seen.add(n);
+                return true;
+            });
+
+        res.json(lista);
+    } catch (err) {
+        next(err);
+    }
 });
 
 module.exports = router;
