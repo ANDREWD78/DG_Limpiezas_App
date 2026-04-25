@@ -1,3 +1,16 @@
+## 2026-04-24
+
+- **Consumibles (Migración Supabase)**: CRUD principal migrado operativamente a PostgreSQL (Supabase). Dual-write a Sheets mantenido como backup de seguridad.
+- **Consumibles (UI)**: Filtros compactos en Dashboard Admin (Estado/Casa). Arranque por defecto en 'Pendiente'.
+- **Consumibles (UX)**: Gestión de cantidad separada (deja de concatenarse en item_otro). Acciones directas de Repuesto y Descartar.
+- **Consumibles (Catálogo)**: Preparado para migración a tabla Supabase (actualmente en arrays legacy).
+- **Incidencias (UI)**: Filtros reorganizados visualmente (Labels arriba, chips compactos) para consistencia con Consumibles.
+- **Validación Producción**: Verificados flujos de alta, resolución y descartado en ambos módulos.
+
+Estado: ✅ en producción  
+Requiere npm install: sí (por session-file-store si no estaba previamente instalado en el entorno)  
+Impacto: backend + frontend
+
 ## 2026-04-22
 
 - Incidencias: múltiples fotos + vídeo

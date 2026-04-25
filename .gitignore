@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+backend/.env
+backend/.env.production
+.agent/
+.claude/
+_backup_local_backend_*/
+credentials/
+*.zip
+.vscode/
+.DS_Store

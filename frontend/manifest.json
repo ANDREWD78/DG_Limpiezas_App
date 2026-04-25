@@ -1,0 +1,42 @@
+{
+    "name": "DG Limpiezas",
+    "short_name": "Limpiezas",
+    "description": "App de gestión de limpiezas - Destino Guara",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#ff8600",
+    "theme_color": "#ff8600",
+    "orientation": "portrait-primary",
+    "lang": "es",
+    "icons": [
+        {
+            "src": "/icons/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png",
+            "purpose": "any maskable"
+        },
+        {
+            "src": "/icons/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any maskable"
+        },
+        {
+            "src": "/icons/apple-touch-icon.png",
+            "sizes": "180x180",
+            "type": "image/png",
+            "purpose": "any"
+        }
+    ],
+    "categories": [
+        "productivity",
+        "utilities"
+    ],
+    "shortcuts": [
+        {
+            "name": "Nueva Limpieza",
+            "url": "/?page=limpieza",
+            "description": "Iniciar registro de limpieza"
+        }
+    ]
+}

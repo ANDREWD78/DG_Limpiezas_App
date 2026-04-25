@@ -7,4 +7,4 @@ Guía rápida de navegación:
 - Pendientes → PENDIENTES-REALES.md
 
 ---
-*Arquitectura rápida: La interfaz activa del admin de incidencias (y filtros) vive integrada en `frontend/js/pages/admin/dashboard.js`.*
+*Arquitectura rápida: El panel de control Admin (Incidencias, Consumibles y Propuestas) vive 100% integrado en `frontend/js/pages/admin/dashboard.js` bajo un patrón de filtros compactos y Supabase-first.*

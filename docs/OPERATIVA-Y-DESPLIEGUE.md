@@ -1,5 +1,5 @@
 # DG LIMPIEZAS APP – OPERATIVA Y DESPLIEGUE
-**Última actualización: 2026-04-22**
+**Última actualización: 2026-04-24**
 
 > **Nota:** Esta es la guía de operativa en VPS. Para el arranque local y acceso desde dispositivos móviles, consultar **INICIO-Y-DIAGNOSTICO-APP.md**. Para la visión global y decisiones del proyecto, consultar el Resumen Maestro.
 
@@ -175,11 +175,14 @@ rm -f /home/andres/dg-limpiezas-app-clean.zip
 
 # 5. Notas de Release - Abril 2026 (Consolidado)
 Esta versión incluye hitos técnicos y funcionales drásticos para la estabilidad y profesionalización:
-- **Incidencias Multimedia y DB (Supabase)**: Soporte completo para múltiples fotos (max 10) y 1 vídeo, con validación MIME real en servidor. El flujo de subida usa **Signed URLs** temporales de Supabase Storage. El modelo de datos completo de Incidencias ha migrado operativamente a Supabase PostgreSQL (escribiendo a Sheets en dual-write como mero backup).
-- **Consolidación UI Admin**: La fuente de verdad visual del panel de incidencias vive 100% nativa en `dashboard.js`. Incluye filtros interactivos, estado "Descartada", y limpieza automática visual de resueltas antiguas. El antiguo `incidencias.js` ha sido deprecado.
-- **Telegram Resiliente**: Se usa `sendMediaGroup` para agrupar fotos en álbumes. Incluye un sistema "Fallback" automático que reintenta enviar imagen por imagen si la API rechaza el lote.
-- **Sesiones Persistentes**: Implementación de `session-file-store` en el backend. Las sesiones de las empleadas ya no se borran al reiniciar PM2 y se elimina el error de producción de `MemoryStore`.
-- **Avaibook Nativo**: Sustituido el cliente HTTP `axios`/`follow-redirects` por el API `fetch` nativo de Node.js (v18+). Elimina por completo los `MaxListenersExceededWarning` en la sincronización del calendario.
+- **Consumibles (Migración DB Supabase)**: Todo el CRUD de consumibles opera prioritariamente contra Supabase PostgreSQL. La escritura (POST/PATCH) realiza dual-write hacia Sheets exclusivamente como backup. La lectura es 100% nativa de Supabase.
+- **Admin Dashboard Pro (Consumibles + Incidencias)**:
+  - Filtros compactos tipo "píldora" con labels superiores para ahorro de espacio en móvil.
+  - Consumibles: arranque por defecto en `Pendiente`, gestión de `cantidad` numérica independiente, y acciones rápidas de `Repuesto` y `Descartar`.
+  - Incidencias: unificada la interfaz de filtros para consistencia visual total.
+- **Incidencias Multimedia y DB (Supabase)**: Soporte completo para múltiples fotos (max 10) y 1 vídeo, con validación MIME real en servidor. El modelo de datos completo de Incidencias ha migrado operativamente a Supabase PostgreSQL.
+- **Telegram Resiliente**: Sistema "Fallback" automático que reintenta enviar imagen por imagen si falla el envío de álbumes agrupados.
+- **Backend Robusto**: Implementación de `session-file-store` para persistencia de sesiones y migración a `fetch` nativo para Avaibook, eliminando fugas de memoria antiguas.
 
 ---
 

@@ -1,5 +1,5 @@
 # DG LIMPIEZAS APP — RESUMEN MAESTRO DEL PROYECTO
-Última actualización: 2026-04-22
+Última actualización: 2026-04-24
 Estado consolidado del proyecto a fecha: Abril 2026
 
 > ⚠️ DOCUMENTO MAESTRO VIGENTE
@@ -9,7 +9,13 @@ Estado consolidado del proyecto a fecha: Abril 2026
 ------------------------------------------------------------
 1. ESTADO GENERAL DEL PROYECTO
 ------------------------------------------------------------
-La app es una PWA monolítica enfocada a móvil, soportada por Node.js/Express y alojada detrás de un proxy Nginx en un VPS con PM2. A nivel global, utiliza Google Sheets como base de datos operativa principal. Sin embargo, el módulo de **Incidencias** opera de forma independiente usando PostgreSQL (Supabase) como base prioritaria, manteniendo a Sheets como backup temporal. Para los archivos y fotos se emplea Supabase Storage. Google Drive queda únicamente como histórico legacy.
+La app es una PWA monolítica enfocada a móvil, soportada por Node.js/Express y alojada detrás de un proxy Nginx en un VPS con PM2. A nivel global, utiliza Google Sheets como base de datos operativa histórica y de respaldo.
+
+**Arquitectura Supabase-First:**
+Los módulos de **Incidencias** y **Consumibles** operan bajo un modelo de base de datos relacional (PostgreSQL en Supabase) como fuente prioritaria:
+- **Lectura (GET)**: 100% nativa desde Supabase.
+- **Escritura (POST/PATCH)**: Escritura bloqueante en Supabase con *dual-write* asíncrono hacia Google Sheets (Backup).
+- **Archivos**: Supabase Storage para fotos y vídeos.
 
 El enfoque central es el **rendimiento con mínima fricción**. Ya se encuentra en fase de operaciones reales (producción documentada). 
 
@@ -21,6 +27,13 @@ Prioridades de la iteración actual: pulido de UX del entorno "Admin" (paneles d
 ------------------------------------------------------------
 Se han completado con éxito y se encuentran en producción las siguientes actualizaciones:
 
+*   **Módulo de Consumibles (Migración Supabase):**
+    *   **Supabase como Base Principal**: CRUD completo migrado a Supabase. Lectura optimizada y escritura con backup en Sheets.
+    *   **Filtros Compactos**: Interfaz de filtros en Dashboard Admin rediseñada (Estado/Casa) con layout tipo "píldora" móvil-first.
+    *   **Arranque Operativo**: La pestaña arranca por defecto en `Estado: Pendiente`.
+    *   **Alta Rápida y Catálogo**: Selector de productos desde catálogo dinámico (actualmente legacy arrays en backend).
+    *   **Gestión de Cantidades**: El campo `cantidad` se gestiona de forma independiente en la base de datos (dejando de ensuciar el campo de texto libre).
+    *   **Acciones Admin**: Botones claros de `✅ Repuesto` y `⛔ Descartar` con refresco de lista inteligente.
 *   **Propuestas de Consumibles:**
     *   Nueva pestaña exclusiva Admin en `dashboard.js`. Sustituye la etiqueta temporal de "Próximamente".
     *   El dashboard muestra contador real de propuestas pendientes.
@@ -50,7 +63,7 @@ Se han completado con éxito y se encuentran en producción las siguientes actua
 *   **Incidencias (Migración DB a Supabase y Control UI):**
     *   **Supabase como Base Principal**: Todo el CRUD de incidencias opera prioritariamente contra Supabase PostgreSQL. La escritura (POST/PATCH) realiza *dual-write* hacia Sheets exclusivamente como backup/fail-safe temporal. La lectura (GET) es 100% nativa desde Supabase.
     *   **Convivencia Híbrida de Medios**: La capa de lectura procesa sin fricción el histórico (Google Drive legacy) y las nuevas inserciones (Paths puros de Supabase Storage).
-    *   **UI Centralizada en Dashboard**: La fuente de verdad visual para el panel de administración es la pestaña integrada en `frontend/js/pages/admin/dashboard.js`. El archivo antiguo fue renombrado a `_legacy_incidencias.js` para evitar confusiones.
+    *   **UI Centralizada en Dashboard**: La fuente de verdad visual para el panel de administración es la pestaña integrada en `frontend/js/pages/admin/dashboard.js`. Los filtros se han compactado siguiendo el nuevo patrón visual (Labels superiores y chips en pila).
     *   **Reglas UX Operativas**: Filtros de Casa y Estado aplicados nativamente en Frontend. El estado `Descartada` queda oculto del pool general salvo búsqueda explícita. El estado `Resuelta` desaparece orgánicamente tras 7 días naturales desde su `fecha_cierre` para mantener la lista limpia de ruido histórico.
 *   **Optimizaciones de Rendimiento y Estabilidad (Backend):**
     *   **Sesiones de Operarios**: Migradas a disco (`session-file-store`), eliminando warnings de memoria de Node.js y manteniendo las sesiones logadas aunque el servidor VPS o PM2 se reinicie.
@@ -77,7 +90,12 @@ Se han completado con éxito y se encuentran en producción las siguientes actua
 *   **Cero Fricción al Trabajador:**
     *   Se eliminaron definitivamente las abstracciones "Nivel de suciedad (1 a 5)" y "Checklist" previo a limpiezas ordinarias en el frontend del usuario estándar, permitiendo acceso superrápido de arranque por fricción de terreno reportada. Se mantiene el soporte backend para su futura vuelta modular.
 *   **Base de datos / Single Source of Truth:**
-    *   No hay RDBMS (Postgres o MySQL) hasta la rama oficial V2.5. La única fuente de verdad es la Spreadsheet maestra. Todo borrado siempre será lógico. Todo parte conserva intactos sus inputs de duración estimada (salvo ajustes del admin y tiempo efectivo manual auditado).
+    *   Partes, usuarios, reservas y módulos legacy siguen operando sobre Google Sheets.
+    *   Incidencias y Consumibles operan bajo modelo Supabase-First:
+        *   GET: lectura desde Supabase.
+        *   POST/PATCH: escritura en Supabase con backup temporal en Sheets (dual-write).
+    *   Google Sheets NO está apagado globalmente.
+    *   Supabase es la fuente operativa principal SOLO para estos módulos migrados.
 *   **Partes Solapados / Concurrentes:**
     *   Máximo 1 parte en progreso simultáneo a nombre directo de UN usuario.
 
