@@ -1,15 +1,45 @@
 'use strict';
-// NOTA: googleapis instanciado al levantar el servidor de forma síncrona 
-// para prevenir que peticiones HTTP entrantes congelen el event loop
-// durante su larga carga inicial (causa de los Empty Reply from server).
+// NOTA: googleapis se carga de forma lazy dentro de getAuth() para evitar
+// bloquear el event loop durante require() en scripts de backfill/utilidades.
+// En el servidor el primer require de sheets se produce antes de aceptar
+// peticiones, por lo que el comportamiento efectivo es idéntico.
+console.log('[SHEETS] Servicio requerido');
 const path = require('path');
-const { google } = require('googleapis');
 
-let _auth = null;
+let _google = null;
+let _auth   = null;
+
+function getGoogleLib() {
+    if (_google) return _google;
+    console.log('[SHEETS] Cargando módulo googleapis...');
+    _google = require('googleapis').google;
+    console.log('[SHEETS] googleapis listo');
+    return _google;
+}
 
 function getAuth() {
     if (_auth) return _auth;
-    if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    const google = getGoogleLib();
+
+    // Diagnóstico de credenciales (sin imprimir secretos)
+    const hasEnvCreds = !!process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    const keyFile = path.resolve(__dirname, '..', '..', 'credentials', 'service-account.json');
+    const fs = require('fs');
+    const hasKeyFile = fs.existsSync(keyFile);
+    const hasSheetId = !!process.env.SHEET_ID;
+
+    console.log(`[SHEETS] SHEET_ID presente: ${hasSheetId}`);
+    console.log(`[SHEETS] Mecanismo de credenciales: ${hasEnvCreds ? 'GOOGLE_SERVICE_ACCOUNT_JSON (env var)' : 'service-account.json (archivo)'}`);
+    if (!hasEnvCreds) {
+        console.log(`[SHEETS] Ruta service-account.json: ${keyFile}`);
+        console.log(`[SHEETS] Archivo existe: ${hasKeyFile}`);
+        if (!hasKeyFile) {
+            console.error('[SHEETS] ERROR: service-account.json no encontrado y GOOGLE_SERVICE_ACCOUNT_JSON no definido');
+        }
+    }
+
+    console.log('[SHEETS] Creando GoogleAuth...');
+    if (hasEnvCreds) {
         const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
         _auth = new google.auth.GoogleAuth({
             credentials,
@@ -19,7 +49,6 @@ function getAuth() {
             ],
         });
     } else {
-        const keyFile = path.resolve(__dirname, '..', '..', 'credentials', 'service-account.json');
         _auth = new google.auth.GoogleAuth({
             keyFile,
             scopes: [
@@ -28,11 +57,12 @@ function getAuth() {
             ],
         });
     }
+    console.log('[SHEETS] GoogleAuth creado');
     return _auth;
 }
 
 function getSheets() {
-    return google.sheets({ version: 'v4', auth: getAuth() });
+    return getGoogleLib().sheets({ version: 'v4', auth: getAuth() });
 }
 
 const SHEET_ID = () => process.env.SHEET_ID;

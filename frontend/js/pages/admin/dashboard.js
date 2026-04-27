@@ -246,6 +246,7 @@ function adminSaludo(nombre) {
 
 // ─── Helpers Reservas ────────────────────────────────────────────────────────
 import { formatFechaCompleta, renderReservaHTML } from '../../utils/reservas.js';
+import { formatTimeMadrid, formatDateMadrid } from '../../utils/time.js';
 
 function getMadridISOString(d = new Date()) {
   const parts = new Intl.DateTimeFormat('en-US', {
@@ -994,7 +995,7 @@ async function partes(el) {
     modal.className = 'modal-overlay';
     modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;display:flex;justify-content:center;align-items:flex-end;backdrop-filter:blur(4px);';
 
-    const fmtTs = (ts) => ts ? ts.slice(11, 16) : '';
+    const fmtTs = (ts) => formatTimeMadrid(ts);
     const iniTs = p.inicio_ts ? fmtTs(p.inicio_ts) : '';
     const finTs = p.fin_ts ? fmtTs(p.fin_ts) : '';
 
@@ -2820,7 +2821,7 @@ async function consumibles(el) {
                 <div class="data-list" style="margin-top:10px;">
                     ${taskLogs.map(l => {
           const dateObj = l.created_ts ? new Date(l.created_ts) : new Date(l.fecha);
-          const dateStr = !isNaN(dateObj) ? dateObj.toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: '2-digit' }) : l.fecha;
+          const dateStr = !isNaN(dateObj) ? formatDateMadrid(dateObj) : l.fecha;
           const user = l.usuario_nombre || l.user_id || 'Sistema';
           const isManual = l.parte_id === 'ADMIN-MANUAL';
 

@@ -2,6 +2,7 @@
 import { api } from '../../api.js';
 import { toast } from '../../components/toast.js';
 import { CASA_ICON } from '../../utils/casas.js';
+import { formatDateTimeMadrid, toDatetimeLocalMadrid } from '../../utils/time.js';
 
 const TIPO_LABEL = {
   cambio: 'Cambio', revision: 'Revisión', profunda: 'Profunda',
@@ -17,12 +18,7 @@ function statusBadge(status) {
   return `<span class="badge" style="background:rgba(239,68,68,.15);color:#f87171;font-size:.7rem;">🔴 ABIERTO</span>`;
 }
 
-function toDatetimeLocal(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  const z = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`;
-}
+function toDatetimeLocal(iso) { return toDatetimeLocalMadrid(iso); }
 function toISO(dlt) { return dlt ? new Date(dlt).toISOString() : ''; }
 function durStr(inicio, fin) {
   const ms = (fin ? new Date(fin) : new Date()) - new Date(inicio);
@@ -97,7 +93,7 @@ export async function renderPartesAbiertos(el) {
             </div>
             <div class="resumen-stat">
               <span class="label">🕐 Inicio</span>
-              <span>${new Date(p.inicio_ts).toLocaleString('es-ES')}</span>
+              <span>${formatDateTimeMadrid(p.inicio_ts)}</span>
             </div>
             <div class="resumen-stat" style="margin-bottom:14px;">
               <span class="label">⏱ En curso</span>

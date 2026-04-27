@@ -7,25 +7,14 @@ const { uploadPartPhoto } = require('../services/supabaseStorage');
 const tg = require('../services/telegram');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
-// ─── Cache en memoria: pausas recientes (cubre latencia de Google Sheets) ────
-// Cuando POST /pausar guarda con éxito, registra una marca aquí.
-// POST /iniciar la consulta antes de rechazar con 409 Sabayés.
-// Key: parteId | Value: { ts (ms), user_id, casa }
-const _pausaReciente = new Map();
-const PAUSA_TTL_MS = 10_000; // 10 s — más que suficiente para cualquier latencia de Sheets
-
-// Elimina del Map todas las entradas ya caducadas.
-// Se llama en cada set y en cada get para evitar acumulación de basura.
-function _purgarPausas() {
-    const ahora = Date.now();
-    for (const [id, marca] of _pausaReciente) {
-        if (ahora - marca.ts >= PAUSA_TTL_MS) _pausaReciente.delete(id);
-    }
-}
-
-// Helper para el retry interno de /iniciar (absorber latencia de Sheets)
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const SABAYES_RETRY_DELAYS = [300, 600, 1000]; // ms — máx ~1.9s total
+// ─── Bloque 1: Supabase client ────────────────────────────────────────────────
+const { createClient } = require('@supabase/supabase-js');
+const supabase = (() => {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!url || !key) { console.error('[PARTES] Supabase no configurado'); return null; }
+    return createClient(url, key, { auth: { persistSession: false } });
+})();
 
 function uid() { return `P-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`; }
 function getMadridParts(d) {
@@ -76,7 +65,13 @@ function fmtTelegramDate(ts) {
     } catch { return ts; }
 }
 
-// ─── Helpers FASE 3: modelo de tiempo acumulado ──────────────────────────────
+// ─── Helpers de tiempo acumulado ─────────────────────────────────────────────
+
+// Convierte pausas_json de Supabase (array JS) o Sheets (string JSON) → array
+function _safeJsonArr(v) {
+    if (Array.isArray(v)) return v;
+    try { return JSON.parse(v || '[]'); } catch { return []; }
+}
 
 // Segundos entre dos timestamps ISO. Tolerante a nulos o inválidos → 0.
 function segEntre(ts1, ts2) {
@@ -97,8 +92,7 @@ function getTiempoLegacySeg(fila) {
     if (!fila.inicio_ts) return 0;
     const fin = fila.fin_ts || now();
     let totalSeg = segEntre(fila.inicio_ts, fin);
-    let pausas = [];
-    try { pausas = JSON.parse(fila.pausas_json || '[]'); } catch { /* fila corrupta — ignorar */ }
+    const pausas = _safeJsonArr(fila.pausas_json); // soporta tanto array (Supabase) como string (Sheets)
     for (const p of pausas) {
         const pFin = p.fin || fin;
         totalSeg -= segEntre(p.inicio, pFin);
@@ -137,7 +131,7 @@ function fmtSegCrono(seg) {
         : `${mm2}:${ss2}`;
 }
 
-// Mapa una fila de PartesLimpieza al objeto parte consumido por el frontend
+// Mapa una fila de partes_limpieza al objeto parte consumido por el frontend
 function _mapParte(r) {
     let cp = null;
     try { cp = r.checklist_progreso_json ? JSON.parse(r.checklist_progreso_json) : {}; } catch { }
@@ -156,7 +150,7 @@ function _mapParte(r) {
     };
 }
 
-// Mapa una fila de PartesLimpieza al objeto abierto inicial (antes F3)
+// Mapa una fila al objeto abierto inicial (usado en admin.js)
 function _mapParteOpen(r) {
     if (!r) return null;
     const tiempoActualSeg = getTiempoActualSeg(r);
@@ -166,12 +160,10 @@ function _mapParteOpen(r) {
         inicio_ts: r.inicio_ts, fecha: r.fecha,
         usuario_nombre: r.usuario_nombre,
         status: r.status || 'ABIERTO',
-        // Tiempo efectivo trabajado (nuevo modelo)
         tiempo_actual_seg: tiempoActualSeg,
         tiempo_actual_hhmm: fmtSegCrono(tiempoActualSeg),
         tiempo_acumulado_seg: getTiempoAcumuladoSeg(r),
         ultimo_reanudar_ts: r.ultimo_reanudar_ts || '',
-        // Compatibilidad legacy (consumido por código existente)
         duracion_actual_min: Math.round(tiempoActualSeg / 60),
         pausas_json: r.pausas_json || '[]',
     };
@@ -199,14 +191,14 @@ router.get('/calendario', requireAuth, async (req, res, next) => {
 
         // Rango de fechas dinámico según rol
         const hoyMesActual = new Date();
-        hoyMesActual.setDate(1); 
-        
+        hoyMesActual.setDate(1);
+
         const calcIni = new Date(hoyMesActual);
         if (isAdmin) calcIni.setMonth(calcIni.getMonth() - 1);
-        
+
         const calcLimiteCalendario = new Date(hoyMesActual);
         calcLimiteCalendario.setMonth(calcLimiteCalendario.getMonth() + (isAdmin ? 11 : 4));
-        calcLimiteCalendario.setDate(0); 
+        calcLimiteCalendario.setDate(0);
 
         const fechaIniCalendario = today(calcIni);
         const fechaFinCalendario = today(calcLimiteCalendario);
@@ -216,15 +208,16 @@ router.get('/calendario', requireAuth, async (req, res, next) => {
             return (r.fecha_entrada <= fechaFinCalendario && r.fecha_salida >= fechaIniCalendario);
         });
 
-        res.json({ 
+        res.json({
             reservasCalendario,
-            fecha: today() // Fecha actual en Madrid para sincronización de "Hoy" en frontend
+            fecha: today()
         });
 
     } catch (err) { next(err); }
 });
 
-// ─── Esquema canónico de columnas de PartesLimpieza (41 cols) ───────────────────
+// ─── Esquema canónico de columnas de PartesLimpieza (41 cols) ─────────────────
+// Se mantiene para _buildSheetRow (backup INSERT en Sheets)
 const PARTE_COLS = [
     'id',                      // 1
     'session_id',              // 2
@@ -270,9 +263,7 @@ const PARTE_COLS = [
     'tareas_periodicas_json',  // 42
 ];
 
-// Construye un array de 41 valores en el orden exacto de PARTE_COLS.
-// Cualquier clave no presente en data queda como string vacío ''
-// (excepto pausas_json que tiene default '[]').
+// Construye un array de valores en el orden exacto de PARTE_COLS.
 function buildParteRow(data = {}) {
     return PARTE_COLS.map(k => {
         if (k === 'pausas_json') return data[k] ?? '[]';
@@ -281,43 +272,57 @@ function buildParteRow(data = {}) {
     });
 }
 
-const SABAYES_CASAS = ['MIRADOR', 'CASON'];
-
-// Un parte está "abierto" si su status es ABIERTO/PAUSADO,
-// o si no tiene status y no tiene fin_ts (compatibilidad con partes históricos)
-function estaAbierto(r) {
-    if (r.status === 'ABIERTO' || r.status === 'PAUSADO') return true;
-    if (!r.status && !r.fin_ts) return true;
-    return false;
+// Helper para backup Sheets en INSERT: re-serializa campos JSONB antes de pasarlos al array
+function _buildSheetRow(data) {
+    return buildParteRow({
+        ...data,
+        pausas_json:            JSON.stringify(data.pausas_json ?? []),
+        checklist_json:         JSON.stringify(data.checklist_json ?? {}),
+        fotos_cierre_urls_json: JSON.stringify(data.fotos_cierre_urls_json ?? {}),
+        tareas_periodicas_json: JSON.stringify(data.tareas_periodicas_json ?? []),
+        admin_editado:          data.admin_editado ? 'true' : '',
+        suciedad_1a5:           data.suciedad_1a5 != null ? String(data.suciedad_1a5) : '',
+        coste_estimado_eur:     data.coste_estimado_eur != null ? String(data.coste_estimado_eur) : '',
+        inicio_ts:              data.inicio_ts || '',
+        fin_ts:                 data.fin_ts || '',
+        ultimo_reanudar_ts:     data.ultimo_reanudar_ts || '',
+        last_alert_ts_open_part: data.last_alert_ts_open_part || '',
+        admin_editado_ts:       data.admin_editado_ts || '',
+        inicio_ts_original:     data.inicio_ts_original || '',
+        fin_ts_original:        data.fin_ts_original || '',
+    });
 }
 
+const SABAYES_CASAS = ['MIRADOR', 'CASON'];
 
 
-// ─── GET /api/partes/open — parte abierto del usuario + stale alert ───────────
+// ─── Bloque 2: GET /api/partes/open ──────────────────────────────────────────
 router.get('/open', requireAuth, async (req, res, next) => {
     try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
         const user = req.session.user;
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
 
-        // Criterio por status primero (Fase 4), fallback !fin_ts para partes históricos
-        const abiertos = rows.filter(r =>
-            (r.user_id === user.user_id || r.usuario_nombre === user.nombre) &&
-            estaAbierto(r)
-        );
+        const { data: abiertos, error } = await supabase
+            .from('partes_limpieza')
+            .select('*')
+            .eq('user_id', user.user_id)
+            .in('status', ['ABIERTO', 'PAUSADO'])
+            .order('inicio_ts', { ascending: false });
+        if (error) return next(error);
 
         console.log(`\n[BACKEND /open] Petición de usuario: ${user.nombre} / ID: ${user.user_id}`);
-        console.log(`[BACKEND /open] Crudos encontrados: ${abiertos.length}`);
-        abiertos.forEach(a => console.log(`   -> ID: ${a.id} | Casa: ${a.casa} | Status: ${a.status || 'ABIERTO'} | Inicio: ${a.inicio_ts}`));
+        console.log(`[BACKEND /open] Crudos encontrados: ${(abiertos || []).length}`);
+        (abiertos || []).forEach(a => console.log(`   -> ID: ${a.id} | Casa: ${a.casa} | Status: ${a.status} | Inicio: ${a.inicio_ts}`));
 
-        if (!abiertos.length) {
+        if (!abiertos || !abiertos.length) {
             console.log(`[BACKEND /open] Devolviendo { open: false }`);
             return res.json({ open: false });
         }
 
-        // El parte “principal”: el ABIERTO; si todos pausados, el primero
+        // El parte "principal": el ABIERTO; si todos pausados, el primero
         const open = abiertos.find(r => r.status === 'ABIERTO') || abiertos[0];
 
-        // Usar nuevo modelo de tiempo (no Date.now() - inicio_ts)
+        // Usar nuevo modelo de tiempo
         const durMin = Math.round(getTiempoActualSeg(open) / 60);
 
         // ── Stale alert (async, no bloquea respuesta) ─────────────────────
@@ -349,17 +354,12 @@ router.get('/open', requireAuth, async (req, res, next) => {
                     `— Duración: ${hh}h ${mm}m`
                 );
 
+                // Actualizar last_alert_ts_open_part en Supabase (no en Sheets)
                 const nowTs = now();
-                const buildAudit = (f) => {
-                    const row = buildParteRow({
-                        ...f,
-                        last_alert_ts_open_part: nowTs,   // actualizar timestamp de alerta
-                        tiempo_acumulado_seg: f.tiempo_acumulado_seg || '0',
-                    });
-                    console.log('[ROW LEN buildAudit]', row.length, row.slice(-6));
-                    return row;
-                };
-                await sheets.updateRow('PartesLimpieza', open._row, buildAudit(open));
+                await supabase
+                    .from('partes_limpieza')
+                    .update({ last_alert_ts_open_part: nowTs })
+                    .eq('id', open.id);
             } catch { /* silencioso */ }
         })();
 
@@ -376,7 +376,6 @@ router.get('/open', requireAuth, async (req, res, next) => {
             open: true,
             stale: durMin > (8 * 60),
             duracion_actual_min: durMin,
-            // parte{} mantiene compatibilidad con todo el código existente
             parte: {
                 id: open.id, session_id: open.session_id,
                 casa: open.casa, tipo: open.tipo_limpieza,
@@ -385,14 +384,13 @@ router.get('/open', requireAuth, async (req, res, next) => {
                 status: open.status || 'ABIERTO',
                 suciedad_1a5: open.suciedad_1a5,
             },
-            // partes[] nuevo: lista completa para el modo 2 tarjetas en reanudar.js
             partes: abiertos.map(r => {
                 const mapped = _mapParte(r);
-                console.log(`\\n[LOG API PARTES] Parte Abierto — ID: ${mapped.id}`);
-                console.log(`Casa: ${mapped.casa} | Usuario: ${r.usuario_nombre || req.session?.user?.nombre} | Status: ${mapped.status}`);
+                console.log(`\n[LOG API PARTES] Parte Abierto — ID: ${mapped.id}`);
+                console.log(`Casa: ${mapped.casa} | Usuario: ${r.usuario_nombre} | Status: ${mapped.status}`);
                 console.log(`Inicio: ${mapped.inicio_ts} | Último reanudar: ${mapped.ultimo_reanudar_ts}`);
-                console.log(`Pausas JSON: ${r.pausas_json}`);
-                console.log(`Acumulado leído: ${r.tiempo_acumulado_seg || 'vacio'} -> ${mapped.tiempo_acumulado_seg}`);
+                console.log(`Pausas JSON: ${JSON.stringify(r.pausas_json)}`);
+                console.log(`Acumulado leído: ${r.tiempo_acumulado_seg} -> ${mapped.tiempo_acumulado_seg}`);
                 console.log(`Efectivo calculado: ${mapped.tiempo_efectivo_seg}`);
                 console.log(`JSON FINAL -> { tiempo_efectivo_seg: ${mapped.tiempo_efectivo_seg}, tiempo_acumulado_seg: ${mapped.tiempo_acumulado_seg} }`);
                 return mapped;
@@ -402,23 +400,25 @@ router.get('/open', requireAuth, async (req, res, next) => {
 });
 
 
-// ─── GET /api/partes/active?casa=X — buscar parte concurrente para join ────────
-
-// Devuelve cleaning_session_id del parte abierto más reciente en esa casa.
-// El frontend lo usa para proponer al usuario unirse a la misma sesión.
+// ─── Bloque 3: GET /api/partes/active ─────────────────────────────────────────
 router.get('/active', requireAuth, async (req, res, next) => {
     try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
         const { casa } = req.query;
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        // Misma casa, abierto (sin fin_ts), iniciado en las últimas 8h
-        const cutoff = now(new Date(Date.now() - 8 * 60 * 60 * 1000));
-        const actives = rows.filter(r =>
-            String(r.status).toUpperCase() !== 'ANULADO' &&
-            r.casa === casa &&
-            !r.fin_ts &&
-            r.inicio_ts >= cutoff
-        ).sort((a, b) => b.inicio_ts.localeCompare(a.inicio_ts)); // más reciente primero
-        const active = actives[0];
+        const cutoff = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString();
+
+        const { data: active, error } = await supabase
+            .from('partes_limpieza')
+            .select('session_id, cleaning_session_id, usuario_nombre, inicio_ts')
+            .eq('casa', casa)
+            .is('fin_ts', null)
+            .gte('inicio_ts', cutoff)
+            .not('status', 'eq', 'ANULADO')
+            .order('inicio_ts', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (error) return next(error);
+
         if (!active) return res.json({ found: false });
         res.json({
             found: true,
@@ -430,62 +430,99 @@ router.get('/active', requireAuth, async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
-// ─── GET /api/partes/open-by-casa — otros partes abiertos (last-person check)
+
+// ─── Bloque 4: GET /api/partes/open-by-casa ───────────────────────────────────
 router.get('/open-by-casa', requireAuth, async (req, res, next) => {
     try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
         const { casa, exclude_id, csid } = req.query;
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const others = rows.filter(r => {
-            if (String(r.status).toUpperCase() === 'ANULADO') return false;
-            if (r.casa !== casa || r.fin_ts || r.id === exclude_id) return false;
-            // Si se pasa csid, filtrar solo por la misma sesión de limpieza
-            if (csid) {
-                return (r.cleaning_session_id === csid || r.session_id === csid);
-            }
-            return true;
-        });
 
-        // FASE 1: Detectar si alguien ya ha subido fotos en esta misma sesión de limpieza
+        let q = supabase
+            .from('partes_limpieza')
+            .select('id, cleaning_session_id, session_id, drive_folder_url, fotos_cierre_urls_json')
+            .eq('casa', casa)
+            .is('fin_ts', null)
+            .not('status', 'eq', 'ANULADO');
+        if (csid) q = q.eq('cleaning_session_id', csid);
+        if (exclude_id) q = q.neq('id', exclude_id);
+
+        const { data: others, error } = await q;
+        if (error) return next(error);
+
+        // Detectar si ya hay fotos en esta sesión de limpieza (incluye partes cerrados)
         let hasPhotos = false;
         if (csid) {
-            hasPhotos = rows.some(r => {
-                if (String(r.status).toUpperCase() === 'ANULADO') return false;
-                // Mismo csid
-                if (r.cleaning_session_id !== csid && r.session_id !== csid) return false;
-                // Verificar si hay fotos válidas (url de drive o array json con datos)
+            const { data: sesionPartes } = await supabase
+                .from('partes_limpieza')
+                .select('drive_folder_url, fotos_cierre_urls_json')
+                .eq('cleaning_session_id', csid)
+                .not('status', 'eq', 'ANULADO');
+            hasPhotos = (sesionPartes || []).some(r => {
                 const hasUrl = r.drive_folder_url && r.drive_folder_url.trim().length > 0;
-                let hasJson = false;
-                if (r.fotos_cierre_urls_json) {
-                    try { const j = JSON.parse(r.fotos_cierre_urls_json); hasJson = Object.keys(j).length > 0; } catch {}
-                }
+                const hasJson = r.fotos_cierre_urls_json && Object.keys(r.fotos_cierre_urls_json).length > 0;
                 return hasUrl || hasJson;
             });
         }
 
-        res.json({ count: others.length, isLast: others.length === 0, hasPhotos });
+        const count = (others || []).length;
+        res.json({ count, isLast: count === 0, hasPhotos });
     } catch (err) { next(err); }
 });
 
 
-// ─── POST /api/partes/iniciar ────────────────────────────────────────────────
+// ─── Bloque 5: GET /api/partes — listar (admin) ───────────────────────────────
+router.get('/', requireAuth, async (req, res, next) => {
+    try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const casa = req.query.casa;
+        const limit = parseInt(req.query.limit) || 50;
+
+        let q = supabase
+            .from('partes_limpieza')
+            .select('*')
+            .not('status', 'eq', 'ANULADO')
+            .order('inicio_ts', { ascending: false })
+            .limit(limit);
+        if (casa) q = q.eq('casa', casa);
+
+        const { data, error } = await q;
+        if (error) return next(error);
+        res.json(data || []);
+    } catch (err) { next(err); }
+});
+
+
+// ─── Bloque 6: POST /api/partes/iniciar ──────────────────────────────────────
 router.post('/iniciar', requireAuth, async (req, res, next) => {
     try {
+        // ── DIAGNÓSTICO TEMPORAL ──────────────────────────────────────────────
+        console.log('[PARTES /iniciar] body:', JSON.stringify(req.body));
+        console.log('[PARTES /iniciar] user:', JSON.stringify({
+            user_id: req.session?.user?.user_id,
+            nombre:  req.session?.user?.nombre,
+            rol:     req.session?.user?.rol,
+        }));
+        console.log('[PARTES /iniciar] supabase:', supabase ? 'OK' : 'NULL');
+
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
         const { casa, tipo_limpieza, cleaning_session_id: joinCleaningSession } = req.body;
         const user = req.session.user;
 
-        // ── Guardia: validación con reglas Sabayés ────────────────────────────
-        // Status como fuente primaria; fallback !fin_ts para partes históricos
-        const all = await sheets.readSheetAsObjects('PartesLimpieza');
-        const abiertosUsuario = all.filter(r =>
-            (r.user_id === user.user_id || r.usuario_nombre === user.nombre) &&
-            estaAbierto(r)
-        );
+        // ── Guardia: validación con reglas Sabayés (sin cache ni retry — Supabase es consistente) ──
+        const { data: abiertosUsuario, error: errAbiertos } = await supabase
+            .from('partes_limpieza')
+            .select('id, casa, status')
+            .eq('user_id', user.user_id)
+            .in('status', ['ABIERTO', 'PAUSADO']);
+        if (errAbiertos) return next(errAbiertos);
 
-        if (abiertosUsuario.length >= 2) {
+        console.log('[PARTES /iniciar] abiertosUsuario:', JSON.stringify(abiertosUsuario));
+
+        if ((abiertosUsuario || []).length >= 2) {
             return res.status(409).json({ error: 'Límite de partes abiertos alcanzado (máximo 2)' });
         }
 
-        if (abiertosUsuario.length === 1) {
+        if ((abiertosUsuario || []).length === 1) {
             const existente = abiertosUsuario[0];
             const esSabayes =
                 SABAYES_CASAS.includes(existente.casa) &&
@@ -493,57 +530,16 @@ router.post('/iniciar', requireAuth, async (req, res, next) => {
                 existente.casa !== casa;
 
             if (esSabayes && existente.status === 'PAUSADO') {
-                // ✓ Excepción Sabayés válida: MIRADOR pausado + CASON activo (o viceversa)
-                // Continuar sin bloquear
-            } else if (esSabayes && (existente.status === 'ABIERTO' || !existente.status)) {
-                // Comprobar cache de pausa reciente antes de rechazar con 409.
-                // Sheets puede no haber propagado aún el PAUSADO escrito hace instantes.
-                _purgarPausas();
-                const marca = _pausaReciente.get(existente.id);
-                const userId = user.user_id || user.nombre;
-                const cacheHit = marca &&
-                    (Date.now() - marca.ts) < PAUSA_TTL_MS &&
-                    marca.user_id === userId &&
-                    marca.casa === existente.casa; // validar también la casa
-
-                if (cacheHit) {
-                    // La pausa existe pero Sheets aún no la refleja — tratar como PAUSADO
-                    _pausaReciente.delete(existente.id); // consumir: no reutilizable
-                    console.log(`[iniciar] Sabayés cache hit: parte ${existente.id} (${existente.casa}) tratado como PAUSADO — ${Date.now() - marca.ts}ms desde la pausa`);
-                    // Continuar sin 409 → crear el nuevo parte
-                } else {
-                    // Sin cache válido: retry interno — releer Sheets hasta 3 veces
-                    // antes de rechazar. Absorbe la latencia de propagación de Sheets.
-                    let resuelto = false;
-                    for (const delay of SABAYES_RETRY_DELAYS) {
-                        await sleep(delay);
-                        const allRetry = await sheets.readSheetAsObjects('PartesLimpieza');
-                        const existenteRetry = allRetry.find(r => r.id === existente.id);
-                        const statusRetry = existenteRetry?.status;
-                        console.log(`[iniciar] Sabayés retry ${delay}ms: parte ${existente.id} status=${statusRetry}`);
-                        // Resuelto si el parte ya no está ABIERTO (o desapareció de Sheets)
-                        if (!existenteRetry ||
-                            statusRetry === 'PAUSADO' ||
-                            statusRetry === 'CERRADO' ||
-                            statusRetry === 'CERRADO_FORZADO') {
-                            resuelto = true;
-                            break;
-                        }
-                    }
-
-                    if (!resuelto) {
-                        // Todos los reintentos exhaustos: 409 real
-                        return res.status(409).json({
-                            error: `Pausa primero tu parte de ${existente.casa} antes de abrir ${casa}`,
-                            sabayes: true,
-                            parteId: existente.id,
-                            open: true,
-                            activo: _mapParte(existente),
-                        });
-                    }
-                }
+                // ✓ Excepción Sabayés válida: parte pausado en otra casa del grupo
+            } else if (esSabayes && existente.status === 'ABIERTO') {
+                return res.status(409).json({
+                    error: `Pausa primero tu parte de ${existente.casa} antes de abrir ${casa}`,
+                    sabayes: true,
+                    parteId: existente.id,
+                    open: true,
+                });
             } else {
-                // No es excepción Sabayés — bloquear
+                // Contrato frontend: incluir parte para que el frontend pueda continuar
                 return res.status(409).json({
                     error: 'Ya tienes un parte abierto',
                     open: true,
@@ -552,67 +548,222 @@ router.post('/iniciar', requireAuth, async (req, res, next) => {
             }
         }
 
-        // continuar con la creación del parte
-
-        // Resolver cleaning_session_id
-        // Si el frontend pasa uno (join), verificar que existe un parte abierto con ese CSI en la misma casa.
-        // Si no existe o no coincide, crear uno nuevo.
+        // ── Resolver cleaning_session_id ──────────────────────────────────────
         let cleaning_session_id = null;
+
         if (joinCleaningSession) {
-            const matchingOpen = all.find(r =>
-                r.casa === casa &&
-                !r.fin_ts &&
-                (r.cleaning_session_id === joinCleaningSession || r.session_id === joinCleaningSession)
-            );
+            // Verificar que el CSI pasado por el frontend existe y está activo en la misma casa
+            const { data: matchingOpen } = await supabase
+                .from('partes_limpieza')
+                .select('cleaning_session_id')
+                .eq('casa', casa)
+                .is('fin_ts', null)
+                .eq('cleaning_session_id', joinCleaningSession)
+                .maybeSingle();
             if (matchingOpen) {
-                cleaning_session_id = matchingOpen.cleaning_session_id || matchingOpen.session_id;
+                cleaning_session_id = matchingOpen.cleaning_session_id;
             }
         }
+
         if (!cleaning_session_id) {
-            // Sin join existente → buscar parte abierto reciente en la misma casa (últimas 8h)
-            const cutoff = now(new Date(Date.now() - 8 * 60 * 60 * 1000));
-            const sameSession = all.find(r =>
-                r.casa === casa && !r.fin_ts && r.inicio_ts >= cutoff
-            );
-            if (sameSession) {
-                // Hay alguien ya limpiando — mismo cleaning_session_id (join automático si el usuario eligió unirse)
-                // Si el frontend no pasó joinCleaningSession es que el usuario eligió "nuevo parte" → CSI propio
-                cleaning_session_id = !joinCleaningSession
-                    ? uid() // nuevo CSI separado
-                    : (sameSession.cleaning_session_id || sameSession.session_id);
-            } else {
-                cleaning_session_id = uid();
-            }
+            // Buscar parte abierto reciente en la misma casa (últimas 8h) para compartir CSI
+            const cutoff8h = new Date(Date.now() - 8 * 60 * 60 * 1000).toISOString();
+            const { data: sameSession } = await supabase
+                .from('partes_limpieza')
+                .select('cleaning_session_id')
+                .eq('casa', casa)
+                .is('fin_ts', null)
+                .gte('inicio_ts', cutoff8h)
+                .limit(1)
+                .maybeSingle();
+
+            cleaning_session_id = sameSession?.cleaning_session_id || uid();
         }
 
         const id = uid();
-        const session_id = uid(); // cada parte tiene su propio session_id único
+        const session_id = uid();
         const inicio_ts = now();
 
-        const rowIniciar = buildParteRow({
+        const newParte = {
             id,
             session_id,
+            cleaning_session_id,
             fecha: today(),
             casa,
             tipo_limpieza,
             inicio_ts,
+            status: 'ABIERTO',
             user_id: user.user_id || user.nombre,
             usuario_nombre: user.nombre,
             created_by: user.nombre,
-            status: 'ABIERTO',
-            cleaning_session_id,
-            pausas_json: '[]',
-            tiempo_acumulado_seg: '0',
+            tiempo_acumulado_seg: 0,
             ultimo_reanudar_ts: inicio_ts,
-        });
-        console.log('[ROW LEN /iniciar]', rowIniciar.length, rowIniciar.slice(-6));
-        await sheets.appendRow('PartesLimpieza', rowIniciar);
+            pausas_json: [],
+            checklist_json: {},
+            fotos_cierre_urls_json: {},
+            tareas_periodicas_json: [],
+        };
+
+        console.log('[PARTES /iniciar] newParte:', JSON.stringify(newParte));
+
+        const { error: errInsert } = await supabase
+            .from('partes_limpieza')
+            .insert(newParte);
+        if (errInsert) {
+            console.error('[PARTES /iniciar] Supabase insert error:', JSON.stringify(errInsert));
+            return res.status(500).json({ error: 'Error guardando parte' });
+        }
+        console.log('[PARTES /iniciar] Supabase insert OK:', id);
+
+        // Backup Sheets — INSERT único (non-blocking, no bloqueante)
+        sheets.appendRow('PartesLimpieza', _buildSheetRow(newParte))
+            .catch(e => console.error('[PARTES][SHEETS BACKUP] iniciar:', e.message));
 
         res.json({ ok: true, id, session_id, cleaning_session_id, inicio_ts });
     } catch (err) { next(err); }
 });
 
-// ─── POST /api/partes/:id/finalizar — cerrar parte con todos los datos ────────
+
+// ─── Bloque 7: POST /api/partes/:id/pausar ───────────────────────────────────
+router.post('/:id/pausar', requireAuth, async (req, res, next) => {
+    try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const { id } = req.params;
+        const user = req.session.user;
+
+        const { data: fila, error: errGet } = await supabase
+            .from('partes_limpieza')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+        if (errGet) return next(errGet);
+
+        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
+        if (fila.status !== 'ABIERTO') {
+            return res.status(409).json({ error: `No se puede pausar un parte en estado ${fila.status}` });
+        }
+
+        // Verificar propiedad (admin puede pausar cualquier parte)
+        const esAdmin = user.rol === 'admin';
+        const esPropietario = fila.user_id === user.user_id || fila.usuario_nombre === user.nombre;
+        if (!esAdmin && !esPropietario) {
+            return res.status(403).json({ error: 'No puedes pausar el parte de otro usuario' });
+        }
+
+        const nowTs = now();
+        const pausas = _safeJsonArr(fila.pausas_json);
+
+        const acumAntes = getTiempoAcumuladoSeg(fila);
+        const tramoActivo = segEntre(fila.ultimo_reanudar_ts, nowTs);
+        console.log('[DEBUG /pausar]', {
+            id, status: fila.status,
+            tiempo_acumulado_seg_fila: fila.tiempo_acumulado_seg,
+            ultimo_reanudar_ts_fila: fila.ultimo_reanudar_ts,
+            nowTs, acumAntes, tramoActivo,
+            nuevoAcum: acumAntes + tramoActivo,
+        });
+
+        pausas.push({ inicio: nowTs, fin: null });
+        const acumPausar = acumAntes + tramoActivo;
+
+        const { error: errUpdate } = await supabase
+            .from('partes_limpieza')
+            .update({
+                status: 'PAUSADO',
+                pausas_json: pausas,
+                tiempo_acumulado_seg: acumPausar,
+                ultimo_reanudar_ts: null,
+            })
+            .eq('id', id);
+        if (errUpdate) return next(errUpdate);
+
+        // NO backup Sheets en updates
+        res.json({ ok: true, status: 'PAUSADO', pausas_json: JSON.stringify(pausas) });
+    } catch (err) { next(err); }
+});
+
+
+// ─── Bloque 8: POST /api/partes/:id/reanudar ─────────────────────────────────
+router.post('/:id/reanudar', requireAuth, async (req, res, next) => {
+    try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const { id } = req.params;
+        const user = req.session.user;
+
+        const { data: fila, error: errGet } = await supabase
+            .from('partes_limpieza')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+        if (errGet) return next(errGet);
+
+        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
+        if (fila.status !== 'PAUSADO') {
+            return res.status(409).json({ error: `No se puede reanudar un parte en estado ${fila.status || 'ABIERTO'}` });
+        }
+
+        // Verificar propiedad
+        const esAdmin = user.rol === 'admin';
+        const esPropietario = fila.user_id === user.user_id || fila.usuario_nombre === user.nombre;
+        if (!esAdmin && !esPropietario) {
+            return res.status(403).json({ error: 'No puedes reanudar el parte de otro usuario' });
+        }
+
+        // Auto-pausar otros partes ABIERTO del mismo usuario (excepción Sabayés)
+        const { data: otrosActivos } = await supabase
+            .from('partes_limpieza')
+            .select('*')
+            .eq('user_id', user.user_id)
+            .eq('status', 'ABIERTO')
+            .neq('id', id);
+
+        const autoPausados = [];
+        for (const otro of (otrosActivos || [])) {
+            const pausaNowTs = now();
+            const pausasOtro = _safeJsonArr(otro.pausas_json);
+            const lastPausaOtro = pausasOtro[pausasOtro.length - 1];
+            if (!lastPausaOtro || lastPausaOtro.fin) {
+                pausasOtro.push({ inicio: pausaNowTs, fin: null });
+            }
+            const otroAcumulado = getTiempoAcumuladoSeg(otro) + segEntre(otro.ultimo_reanudar_ts, pausaNowTs);
+            await supabase
+                .from('partes_limpieza')
+                .update({
+                    status: 'PAUSADO',
+                    pausas_json: pausasOtro,
+                    tiempo_acumulado_seg: otroAcumulado,
+                    ultimo_reanudar_ts: null,
+                })
+                .eq('id', otro.id);
+            autoPausados.push(otro.id);
+        }
+
+        // Reanudar: cerrar último tramo de pausa abierto
+        const reanudarNowTs = now();
+        const pausas = _safeJsonArr(fila.pausas_json);
+        const lastPausa = pausas[pausas.length - 1];
+        if (lastPausa && !lastPausa.fin) {
+            lastPausa.fin = reanudarNowTs;
+        }
+
+        const { error: errUpdate } = await supabase
+            .from('partes_limpieza')
+            .update({
+                status: 'ABIERTO',
+                pausas_json: pausas,
+                tiempo_acumulado_seg: getTiempoAcumuladoSeg(fila),
+                ultimo_reanudar_ts: reanudarNowTs,
+            })
+            .eq('id', id);
+        if (errUpdate) return next(errUpdate);
+
+        // NO backup Sheets en updates
+        res.json({ ok: true, status: 'ABIERTO', pausas_json: JSON.stringify(pausas), auto_pausados: autoPausados });
+    } catch (err) { next(err); }
+});
+
+
+// ─── Bloque 9: POST /api/partes/:id/finalizar ────────────────────────────────
 const fotosUpload = upload.fields([
     { name: 'fotos_cierre', maxCount: 20 },
     { name: 'fotos_antes', maxCount: 10 },
@@ -620,14 +771,19 @@ const fotosUpload = upload.fields([
 
 router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) => {
     try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
         const { id } = req.params;
         const user = req.session.user;
         const body = req.body;
         const fin_ts = now();
 
-        // Recuperar la fila para calcular duración
-        const all = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = all.find(r => r.id === id);
+        // Recuperar la fila desde Supabase
+        const { data: fila, error: errGet } = await supabase
+            .from('partes_limpieza')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+        if (errGet) return next(errGet);
         if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
 
         const duracion_min = diffMin(fila.inicio_ts, fin_ts);
@@ -637,9 +793,9 @@ router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) =
 
         // Subir fotos a Supabase Storage
         const casa = fila.casa;
-        const fecha = today().split('-').reverse().join('-'); // DD-MM-YYYY
-        const folderName = `${fecha}_${id}`;
-        let driveFolderUrl = '';   // compatibilidad con la columna existente
+        const fechaStr = today().split('-').reverse().join('-'); // DD-MM-YYYY
+        const folderName = `${fechaStr}_${id}`;
+        let driveFolderUrl = '';
         let fotosUrls = {};
 
         const todasLasFotos = [
@@ -650,104 +806,103 @@ router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) =
         if (todasLasFotos.length > 0) {
             for (const f of todasLasFotos) {
                 const fileName = `${Date.now()}_${f.originalname}`;
-                const path = `${casa}/${folderName}/${fileName}`;
-
-                const storedPath = await uploadPartPhoto(f.buffer, path, f.mimetype);
-
+                const filePath = `${casa}/${folderName}/${fileName}`;
+                const storedPath = await uploadPartPhoto(f.buffer, filePath, f.mimetype);
                 const zona = f.zona || 'general';
                 if (!fotosUrls[zona]) fotosUrls[zona] = [];
                 fotosUrls[zona].push(storedPath);
             }
         }
+
         // Valores del body
-        const suciedad = body.suciedad_1a5 || '';
-        const checklistJson = body.checklist_json || '{}';
-        const resumen = body.resumen || '';
-        const pendiente = body.pendiente || '';
-        const ropaSucia = body.ropa_sucia_estado || '';
-        const lena = body.lena_rellenada || '';
-        const pellets = body.pellets_rellenado || '';
-        const casaLista = body.casa_lista || '';
+        const suciedad       = body.suciedad_1a5 || '';
+        const checklistJson  = body.checklist_json || '{}';
+        const resumen        = body.resumen || '';
+        const pendiente      = body.pendiente || '';
+        const ropaSucia      = body.ropa_sucia_estado || '';
+        const lena           = body.lena_rellenada || '';
+        const pellets        = body.pellets_rellenado || '';
+        const casaLista      = body.casa_lista || '';
         const casaListaFalta = body.casa_lista_falta_texto || '';
-        const motiDemora = body.motivo_demora || '';
-        const motiDetalle = body.motivo_demora_detalle || '';
+        const motiDemora     = body.motivo_demora || '';
+        const motiDetalle    = body.motivo_demora_detalle || '';
         const tareasRealizadas = body.tareas_realizadas || '';
 
-        // ── Procesar pausas y calcular tiempo efectivo ──────────────────────
-        // 1. Cerrar pausa abierta si el parte se cierra mientras está PAUSADO
-        // 2. Calcular tiempo efectivo usando el nuevo modelo de acumulado (Fase 3)
-        const pausas = JSON.parse(fila.pausas_json || '[]');
+        // Procesar pausas y calcular tiempo efectivo
+        const pausas = _safeJsonArr(fila.pausas_json);
         const lastPausa = pausas[pausas.length - 1];
         if (lastPausa && !lastPausa.fin) {
-            lastPausa.fin = fin_ts; // cerrar tramo de pausa con el mismo fin_ts
+            lastPausa.fin = fin_ts;
         }
-        const pausasJsonFinal = JSON.stringify(pausas);
 
-        // Tiempo acumulado final: sumar tramo activo si venía ABIERTO
+        // Tiempo acumulado final
         const segFinal = fila.status === 'ABIERTO' && fila.ultimo_reanudar_ts
             ? getTiempoAcumuladoSeg(fila) + segEntre(fila.ultimo_reanudar_ts, fin_ts)
-            : getTiempoActualSeg(fila); // PAUSADO o legacy
+            : getTiempoActualSeg(fila);
         const tiempoEfectivo = Math.round(segFinal / 60);
 
+        // Parsear checklist_json: puede venir como string del body
+        let checklistObj = {};
+        try { checklistObj = JSON.parse(checklistJson); } catch { checklistObj = {}; }
 
-        const nuevaFila = buildParteRow({
-            ...fila,
-            // Sobreescribir con valores del cierre
-            suciedad_1a5: suciedad,
-            fin_ts,
-            duracion_min: String(duracion_min),
-            user_id: user.user_id || user.nombre,
-            usuario_nombre: user.nombre,
-            motivo_demora: motiDemora,
-            motivo_demora_detalle: motiDetalle,
-            checklist_json: checklistJson,
-            resumen,
-            pendiente,
-            ropa_sucia_estado: ropaSucia,
-            lena_rellenada: lena,
-            pellets_rellenado: pellets,
-            casa_lista: casaLista,
-            casa_lista_falta_texto: casaListaFalta,
-            drive_folder_url: driveFolderUrl,
-            fotos_cierre_urls_json: JSON.stringify(fotosUrls),
-            coste_estimado_eur: coste,
-            created_by: user.nombre,
-            tareas_realizadas: tareasRealizadas,
-            status: 'CERRADO',
-            cleaning_session_id: fila.cleaning_session_id || fila.session_id || '',
-            limpieza_profunda_texto: body.limpieza_profunda_texto || '',
-            tiempo_efectivo_min: String(tiempoEfectivo),
-            pausas_json: pausasJsonFinal,
-            observaciones: body.observaciones || '',
-            tiempo_acumulado_seg: String(segFinal),
-            ultimo_reanudar_ts: '',
-            tareas_periodicas_json: body.tareas_periodicas_json || '',
-        });
-        console.log('[ROW LEN /finalizar]', nuevaFila.length, nuevaFila.slice(-6));
-        await sheets.updateRow('PartesLimpieza', fila._row, nuevaFila);
+        // Parsear tareas_periodicas_json
+        let tareasPeriodicasObj = [];
+        try { tareasPeriodicasObj = JSON.parse(body.tareas_periodicas_json || '[]'); } catch { tareasPeriodicasObj = []; }
 
-        // Comprobar si es el último (server-side) con cleaning_session_id
+        // Update en Supabase (sin backup Sheets en updates)
+        const { error: errUpdate } = await supabase
+            .from('partes_limpieza')
+            .update({
+                fin_ts,
+                status: 'CERRADO',
+                suciedad_1a5: parseInt(suciedad) || null,
+                duracion_min,
+                tiempo_efectivo_min: tiempoEfectivo,
+                tiempo_acumulado_seg: segFinal,
+                pausas_json: pausas,
+                checklist_json: checklistObj,
+                resumen,
+                pendiente,
+                ropa_sucia_estado: ropaSucia,
+                lena_rellenada: lena,
+                pellets_rellenado: pellets,
+                casa_lista: casaLista,
+                casa_lista_falta_texto: casaListaFalta,
+                motivo_demora: motiDemora,
+                motivo_demora_detalle: motiDetalle,
+                tareas_realizadas: tareasRealizadas,
+                limpieza_profunda_texto: body.limpieza_profunda_texto || null,
+                observaciones: body.observaciones || null,
+                drive_folder_url: driveFolderUrl || null,
+                fotos_cierre_urls_json: fotosUrls,
+                coste_estimado_eur: coste ? parseFloat(coste) : null,
+                ultimo_reanudar_ts: null,
+                tareas_periodicas_json: tareasPeriodicasObj,
+            })
+            .eq('id', id);
+        if (errUpdate) return next(errUpdate);
+
+        // isLast: otros partes abiertos con el mismo cleaning_session_id
         const cleaningSID = fila.cleaning_session_id || fila.session_id;
-        const allAfter = await sheets.readSheetAsObjects('PartesLimpieza');
-        const otherOpen = allAfter.filter(r =>
-            r.id !== id &&
-            !r.fin_ts &&
-            (r.cleaning_session_id === cleaningSID || r.session_id === cleaningSID)
-        );
-        const isLast = otherOpen.length === 0;
+        const { data: otrosAbiertos } = await supabase
+            .from('partes_limpieza')
+            .select('id')
+            .eq('cleaning_session_id', cleaningSID)
+            .neq('id', id)
+            .is('fin_ts', null)
+            .not('status', 'eq', 'ANULADO');
+        const isLast = !otrosAbiertos || otrosAbiertos.length === 0;
 
-        // Notificación Telegram v2 (no bloquea la respuesta)
+        // Notificación Telegram (non-blocking) — leer consumibles e incidencias de Supabase
         (async () => {
             try {
-                // Leer consumibles e incidencias vinculados al parte (por parte_id)
-                const [consList, incsList] = await Promise.all([
-                    sheets.readSheetAsObjects('Consumibles')
-                        .then(rows => rows.filter(r => r.parte_id === id))
-                        .catch(() => []),
-                    sheets.readSheetAsObjects('IncidenciasMantenimiento')
-                        .then(rows => rows.map(r => ({ ...r, estado: r.estado === 'Abierta' ? 'Pendiente' : r.estado })).filter(r => r.parte_id === id))
-                        .catch(() => []),
+                const [consResult, incsResult] = await Promise.all([
+                    supabase.from('consumibles').select('*').eq('parte_id', id),
+                    supabase.from('incidencias').select('*').eq('parte_id', id),
                 ]);
+                const consList = consResult.data || [];
+                const incsList = incsResult.data || [];
+
                 await tg.notificarParte({
                     casa,
                     tipo_limpieza: fila.tipo_limpieza,
@@ -772,7 +927,7 @@ router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) =
             } catch (e) { console.error('[TG notificarParte]', e.message); }
         })();
 
-        // ─── Tareas periódicas — try/catch: no bloquea el cierre ─────────────
+        // ─── Tareas periódicas — sigue escribiendo en Sheets (sin cambio) ────
         (async () => {
             try {
                 const tpRaw = body.tareas_periodicas_json;
@@ -781,14 +936,13 @@ router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) =
                 if (!tareasSelec.length) return;
 
                 const tpRows = await sheets.readSheetAsObjects('TareasPeriodicas');
-                const finTs = fin_ts; // ya definido en linea 550 via now()
+                const finTs = fin_ts;
 
                 for (const t of tareasSelec) {
                     const frow = tpRows.find(r => r.id === t.task_id);
 
-                    // Log siempre (tarea mostrada, done o no)
                     await sheets.appendRow('TareasPeriodicasLog', [
-                        `TPL-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, // id
+                        `TPL-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
                         t.task_id,
                         id,
                         fila.session_id || '',
@@ -799,16 +953,14 @@ router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) =
                         String(t.done),
                         user.id || '',
                         user.nombre || '',
-                        '', // observaciones
+                        '',
                         finTs,
                     ]);
 
-                    // Actualizar TareasPeriodicas solo si done
                     if (t.done && frow) {
                         const meses = parseInt(frow.periodicidad_meses) || 1;
                         const proxima = new Date(finTs);
                         proxima.setMonth(proxima.getMonth() + meses);
-                        // Reescribir fila con columnas actualizadas
                         const headers = Object.keys(frow).filter(k => k !== '_row');
                         const updatedRow = headers.map(h => {
                             if (h === 'ultima_realizacion_ts') return finTs;
@@ -831,165 +983,4 @@ router.post('/:id/finalizar', requireAuth, fotosUpload, async (req, res, next) =
     } catch (err) { next(err); }
 });
 
-// ─── GET /api/partes — listar (admin) ─────────────────────────────────────────
-router.get('/', requireAuth, async (req, res, next) => {
-    try {
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const casa = req.query.casa;
-        const limit = parseInt(req.query.limit) || 50;
-        let filtered = rows.filter(r => String(r.status).toUpperCase() !== 'ANULADO');
-        if (casa) filtered = filtered.filter(r => r.casa === casa);
-        res.json(filtered.reverse().slice(0, limit).map(({ _row, ...rest }) => rest));
-    } catch (err) { next(err); }
-});
-
-// ─── POST /api/partes/:id/pausar ──────────────────────────────────────────────
-// Pausa un parte ABIERTO. Solo el propietario o un admin puede pausar.
-// Añade {inicio: now, fin: null} a pausas_json. status → PAUSADO.
-router.post('/:id/pausar', requireAuth, async (req, res, next) => {
-    try {
-        const { id } = req.params;
-        const user = req.session.user;
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = rows.find(r => r.id === id);
-
-        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
-        if (fila.status !== 'ABIERTO' && fila.status) {
-            return res.status(409).json({ error: `No se puede pausar un parte en estado ${fila.status}` });
-        }
-
-        // Verificar propiedad (admin puede pausar cualquier parte)
-        const esAdmin = user.rol === 'admin';
-        const esPropietario = fila.user_id === user.user_id || fila.usuario_nombre === user.nombre;
-        if (!esAdmin && !esPropietario) {
-            return res.status(403).json({ error: 'No puedes pausar el parte de otro usuario' });
-        }
-
-        // Añadir tramo de pausa abierto
-        const pausas = JSON.parse(fila.pausas_json || '[]');
-        const nowTs = now(); // capturar timestamp único para pausas y cols v3
-
-        // DEBUG ── eliminar cuando el bug esté confirmado
-        const acumAntes = getTiempoAcumuladoSeg(fila);
-        const tramoActivo = segEntre(fila.ultimo_reanudar_ts, nowTs);
-        console.log('[DEBUG /pausar]', {
-            id, status: fila.status,
-            tiempo_acumulado_seg_fila: fila.tiempo_acumulado_seg,
-            ultimo_reanudar_ts_fila: fila.ultimo_reanudar_ts,
-            nowTs,
-            acumAntes,
-            tramoActivo,
-            nuevoAcum: acumAntes + tramoActivo,
-        });
-        // END DEBUG
-
-        pausas.push({ inicio: nowTs, fin: null });
-
-        // Construir fila actualizada (preservar todas las columnas)
-        const acumPausar = getTiempoAcumuladoSeg(fila) + segEntre(fila.ultimo_reanudar_ts, nowTs);
-        const filaActualizada = buildParteRow({
-            ...fila,
-            status: 'PAUSADO',
-            cleaning_session_id: fila.cleaning_session_id || fila.session_id || '',
-            pausas_json: JSON.stringify(pausas),
-            tiempo_acumulado_seg: String(acumPausar),
-            ultimo_reanudar_ts: '',
-        });
-        console.log('[ROW LEN /pausar]', filaActualizada.length, filaActualizada.slice(-6));
-
-        await sheets.updateRow('PartesLimpieza', fila._row, filaActualizada);
-
-        // Registrar marca de pausa reciente para cubrir latencia de Sheets en POST /iniciar
-        _purgarPausas();
-        _pausaReciente.set(id, {
-            ts: Date.now(),
-            user_id: user.user_id || user.nombre,
-            casa: fila.casa,
-        });
-        console.log(`[pausar] marca reciente registrada para parte ${id} (${fila.casa}) — TTL ${PAUSA_TTL_MS}ms`);
-
-        res.json({ ok: true, status: 'PAUSADO', pausas_json: JSON.stringify(pausas) });
-    } catch (err) { next(err); }
-});
-
-// ─── POST /api/partes/:id/reanudar ────────────────────────────────────────────
-// Reanuda un parte PAUSADO. Solo el propietario o un admin puede reanudar.
-// Cierra el último tramo de pausa (fin = now). status → ABIERTO.
-// Bloquea si el usuario ya tiene otro ACTIVO que no sea el caso Sabayés.
-router.post('/:id/reanudar', requireAuth, async (req, res, next) => {
-    try {
-        const { id } = req.params;
-        const user = req.session.user;
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = rows.find(r => r.id === id);
-
-        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
-        if (fila.status !== 'PAUSADO') {
-            return res.status(409).json({ error: `No se puede reanudar un parte en estado ${fila.status || 'ABIERTO'}` });
-        }
-
-        // Verificar propiedad
-        const esAdmin = user.rol === 'admin';
-        const esPropietario = fila.user_id === user.user_id || fila.usuario_nombre === user.nombre;
-        if (!esAdmin && !esPropietario) {
-            return res.status(403).json({ error: 'No puedes reanudar el parte de otro usuario' });
-        }
-
-        // Verificar que el usuario no tiene ya otro ACTIVO (fuera del Sabayés controlado)
-        const otrosActivos = rows.filter(r =>
-            r.id !== id &&
-            (r.user_id === user.user_id || r.usuario_nombre === user.nombre) &&
-            r.status === 'ABIERTO'
-        );
-        // Auto-pausar cualquier otro parte ABIERTO del mismo usuario (excepción Sabayés)
-        const autoPausados = [];
-        for (const otro of otrosActivos) {
-            let pausasOtro = [];
-            try { pausasOtro = JSON.parse(otro.pausas_json || '[]'); } catch { /* ignore */ }
-            // Capturar el timestamp único para esta auto-pausa
-            const pausaNowTs = now();
-            // Abrir un tramo de pausa si el último está abierto o no hay ninguno
-            const lastPausaOtro = pausasOtro[pausasOtro.length - 1];
-            if (!lastPausaOtro || lastPausaOtro.fin) {
-                pausasOtro.push({ inicio: pausaNowTs, fin: null });
-            }
-            // Calcular acumulado correcto: sumar tramo desde ultimo_reanudar_ts hasta ahora
-            const otroAcumulado = getTiempoAcumuladoSeg(otro) + segEntre(otro.ultimo_reanudar_ts, pausaNowTs);
-            const filaOtro = buildParteRow({
-                ...otro,
-                status: 'PAUSADO',
-                cleaning_session_id: otro.cleaning_session_id || otro.session_id || '',
-                pausas_json: JSON.stringify(pausasOtro),
-                tiempo_acumulado_seg: String(otroAcumulado),
-                ultimo_reanudar_ts: '',
-            });
-            console.log('[ROW LEN /reanudar auto-pausa]', filaOtro.length, filaOtro.slice(-6));
-            await sheets.updateRow('PartesLimpieza', otro._row, filaOtro);
-            autoPausados.push(otro.id);
-        }
-
-        // Cerrar el último tramo de pausa abierto con el mismo timestamp que se usará
-        // como ultimo_reanudar_ts para mantener coherencia
-        const reanudarNowTs = now();
-        const pausas = JSON.parse(fila.pausas_json || '[]');
-        const lastPausa = pausas[pausas.length - 1];
-        if (lastPausa && !lastPausa.fin) {
-            lastPausa.fin = reanudarNowTs;
-        }
-
-        const filaActualizada = buildParteRow({
-            ...fila,
-            status: 'ABIERTO',
-            cleaning_session_id: fila.cleaning_session_id || fila.session_id || '',
-            pausas_json: JSON.stringify(pausas),
-            tiempo_acumulado_seg: String(getTiempoAcumuladoSeg(fila)),
-            ultimo_reanudar_ts: reanudarNowTs,
-        });
-        console.log('[ROW LEN /reanudar]', filaActualizada.length, filaActualizada.slice(-6));
-        await sheets.updateRow('PartesLimpieza', fila._row, filaActualizada);
-        res.json({ ok: true, status: 'ABIERTO', pausas_json: JSON.stringify(pausas), auto_pausados: autoPausados });
-    } catch (err) { next(err); }
-});
-
 module.exports = router;
-

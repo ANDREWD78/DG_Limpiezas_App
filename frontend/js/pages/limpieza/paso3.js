@@ -2,12 +2,13 @@
 import { api } from '../../api.js';
 import { toast } from '../../components/toast.js';
 import { resetLimpieza } from '../../app.js';
+import { timeMadrid } from '../../utils/time.js';
 
 export function renderPaso3(navigate, state) {
     const container = document.getElementById('page-container');
     const { piso, tipo, personas, horaInicio, tiempoObjetivo, checklist, fotos, consumibles, incidencia } = state.limpieza;
 
-    const horaFin = new Date().toTimeString().slice(0, 5);
+    const horaFin = timeMadrid();
     const [hI, mI] = horaInicio.split(':').map(Number);
     const [hF, mF] = horaFin.split(':').map(Number);
     const tiempoReal = Math.max(1, (hF * 60 + mF) - (hI * 60 + mI));

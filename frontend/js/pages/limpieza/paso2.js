@@ -1,5 +1,6 @@
 // ─── Paso 2: Checklist + Fotos + Consumibles + Incidencia ──────────────────
 import { toast } from '../../components/toast.js';
+import { timeMadrid } from '../../utils/time.js';
 
 const CHECKLISTS = {
     cambio: [
@@ -67,8 +68,8 @@ export function renderPaso2(navigate, state) {
     function getElapsedMin() {
         if (!horaInicio) return 0;
         const [hI, mI] = horaInicio.split(':').map(Number);
-        const now = new Date();
-        return Math.max(0, Math.floor((now.getHours() * 60 + now.getMinutes()) - (hI * 60 + mI)));
+        const [hN, mN] = timeMadrid().split(':').map(Number);
+        return Math.max(0, Math.floor((hN * 60 + mN) - (hI * 60 + mI)));
     }
 
     function timerClass(mins) {

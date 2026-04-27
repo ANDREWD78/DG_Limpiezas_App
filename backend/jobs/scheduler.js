@@ -5,6 +5,10 @@
 // node-cron bloquee el arranque del servidor al ser cargado a nivel de módulo.
 
 function start() {
+    if (process.env.NODE_ENV !== 'production') {
+        console.log('[Scheduler] Cron jobs DESACTIVADOS en desarrollo (NODE_ENV != production)');
+        return;
+    }
     try {
         const cron = require('node-cron');
         const dailyReminder = require('./dailyReminder');

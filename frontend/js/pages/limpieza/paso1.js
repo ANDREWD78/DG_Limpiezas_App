@@ -1,6 +1,7 @@
 // ─── Paso 1: Selección de piso, tipo y personas ────────────────────────────
 import { api } from '../../api.js';
 import { toast } from '../../components/toast.js';
+import { timeMadrid } from '../../utils/time.js';
 
 const PISOS = [
     { id: 'MIRADOR', icon: '🏔️', desc: 'El Mirador del Guara', maxPersonas: 3 },
@@ -179,7 +180,7 @@ export function renderPaso1(navigate, state) {
         state.limpieza.tipo = tipoSel;
         state.limpieza.personas = personasSel;
         state.limpieza.tiempoObjetivo = t ? t.base : 60;
-        state.limpieza.horaInicio = new Date().toTimeString().slice(0, 5);
+        state.limpieza.horaInicio = timeMadrid();
         navigate('paso2');
     });
 }
