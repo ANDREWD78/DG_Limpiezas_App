@@ -1,5 +1,5 @@
 # DG LIMPIEZAS APP – OPERATIVA Y DESPLIEGUE
-**Última actualización: 2026-04-24**
+**Última actualización: 2026-04-28**
 
 > **Nota:** Esta es la guía de operativa en VPS. Para el arranque local y acceso desde dispositivos móviles, consultar **INICIO-Y-DIAGNOSTICO-APP.md**. Para la visión global y decisiones del proyecto, consultar el Resumen Maestro.
 
@@ -220,9 +220,21 @@ Para que el login persista detrás de Nginx, `backend/server.js` debe incluir:
 - `app.set('trust proxy', 1);`
 - `proxy: true` en la configuración de `express-session`.
 
+### Variables de entorno requeridas (`.env`)
+Desde la migración de partes a Supabase (abril 2026), son obligatorias:
+```
+SUPABASE_URL=https://<proyecto>.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<service_role_key>
+```
+Sin estas dos variables, todos los endpoints de partes y admin migrados devuelven 500.
+
 ### Archivos Excluidos y Peligrosos
 Nunca subir al runtime de producción:
 - Los archivos en `backend/scripts/diagnostics/_dangerous/`. (Son destructivos para la base de datos Sheet).
+- `backend/data/backfill/PartesLimpieza.csv` — solo es un snapshot histórico de migración. No ejecutar backfill con `--force` en producción. Si se necesita re-ejecutar: `node scripts/backfill_partes_csv.js --skip-existing`.
 
 ### Restauración Crítica
-Si el `.env` se corrompe o borra, el backup maestro está en `/home/andres/.env.limpiezas.backup`. Revisar siempre `SESSION_SECRET`, `SHEET_ID` y `AVAIBOOK_TOKEN` tras restaurar.
+Si el `.env` se corrompe o borra, el backup maestro está en `/home/andres/.env.limpiezas.backup`. Revisar siempre `SESSION_SECRET`, `SHEET_ID`, `AVAIBOOK_TOKEN`, `SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY` tras restaurar.
+
+### Nota de desincronización temporal (Abril 2026)
+`GET /admin/dashboard` aún lee `PartesLimpieza` desde Sheets. Los partes cerrados/editados/anulados desde admin solo actualizan Supabase. El dashboard puede mostrar datos ligeramente desincronizados hasta que se complete la segunda fase de migración. No es un bug, es una limitación conocida y documentada.

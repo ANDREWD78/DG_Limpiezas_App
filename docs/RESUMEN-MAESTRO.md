@@ -1,5 +1,5 @@
 # DG LIMPIEZAS APP — RESUMEN MAESTRO DEL PROYECTO
-Última actualización: 2026-04-24
+Última actualización: 2026-04-28
 Estado consolidado del proyecto a fecha: Abril 2026
 
 > ⚠️ DOCUMENTO MAESTRO VIGENTE
@@ -90,12 +90,17 @@ Se han completado con éxito y se encuentran en producción las siguientes actua
 *   **Cero Fricción al Trabajador:**
     *   Se eliminaron definitivamente las abstracciones "Nivel de suciedad (1 a 5)" y "Checklist" previo a limpiezas ordinarias en el frontend del usuario estándar, permitiendo acceso superrápido de arranque por fricción de terreno reportada. Se mantiene el soporte backend para su futura vuelta modular.
 *   **Base de datos / Single Source of Truth:**
-    *   Partes, usuarios, reservas y módulos legacy siguen operando sobre Google Sheets.
+    *   Usuarios, reservas y módulos legacy siguen operando sobre Google Sheets.
+    *   **Partes de limpieza** operan bajo modelo Supabase-First (migración FASE 3, abril 2026):
+        *   Tabla: `partes_limpieza` (PostgreSQL Supabase).
+        *   GET/UPDATE/INSERT: 100% Supabase.
+        *   Sheets solo como backup asíncrono en `POST /partes` (nuevo parte) y `POST /partes/manual`. Los updates (pausar, reanudar, cerrar, editar, anular) **ya no escriben en Sheets**.
+        *   `GET /admin/dashboard` pendiente de segunda fase — aún lee Sheets, puede estar desincronizado respecto a ediciones recientes.
     *   Incidencias y Consumibles operan bajo modelo Supabase-First:
         *   GET: lectura desde Supabase.
         *   POST/PATCH: escritura en Supabase con backup temporal en Sheets (dual-write).
     *   Google Sheets NO está apagado globalmente.
-    *   Supabase es la fuente operativa principal SOLO para estos módulos migrados.
+    *   Supabase es la fuente operativa principal para: Partes, Incidencias, Consumibles.
 *   **Partes Solapados / Concurrentes:**
     *   Máximo 1 parte en progreso simultáneo a nombre directo de UN usuario.
 
@@ -120,12 +125,15 @@ Se han completado con éxito y se encuentran en producción las siguientes actua
 6. BACKEND / INTEGRACIONES Y MODELO BASAL
 ------------------------------------------------------------
 *   **Controladores/Endpoints principales (`/api/...`)**:
-    *   `/partes` y subrutas `/(action)/open-by-casa`.
-    *   `/admin/anular-parte` -> marca Status = `ANULADO`, audita y recalcula.
-    *   Sheets.js maneja caché temporal.
+    *   `/partes` y subrutas — Supabase-primary. Tabla: `partes_limpieza`.
+    *   `/admin/partes/:id/(cerrar|editar-horas|ajustar-tiempo|anular)` — Supabase.
+    *   `/admin/resumen-mensual`, `/admin/partes-abiertos` — Supabase.
+    *   `/admin/dashboard` — Sheets (segunda fase pendiente).
+    *   Sheets.js maneja caché temporal para módulos aún no migrados.
 *   **Autenticación**: Doble flujo: API PIN + Cookies de SESIÓN HTTP-Only.
-*   **Modelo de Datos Básico (Representación Sheets `PartesLimpieza`)**:
-    `id` | `session_id` | `fecha` | `casa` | `tipo_limpieza` | `inicio_ts` | `fin_ts` | `duracion_min` | `user_id` | `usuario_nombre` | `motivo_demora` | `coste_estimado_eur` | `admin_editado` | `status` | ...
+*   **Timestamps**: Supabase almacena en UTC (`timestamptz`). El frontend muestra Europe/Madrid vía `frontend/js/utils/time.js`.
+*   **Modelo de Datos — Tabla `partes_limpieza` (Supabase, 42 columnas)**:
+    `id` | `session_id` | `fecha` | `casa` | `tipo_limpieza` | `inicio_ts` | `fin_ts` | `duracion_min` | `user_id` | `usuario_nombre` | `coste_estimado_eur` | `admin_editado` (boolean) | `status` | `pausas_json` (JSONB) | `tiempo_acumulado_seg` | `ultimo_reanudar_ts` | ...
 
 ------------------------------------------------------------
 6.5 SUPABASE STORAGE (FOTOS)
@@ -148,6 +156,7 @@ Se han completado con éxito y se encuentran en producción las siguientes actua
 *   **Refactor de Inputs de Hora**: Eliminar los `<input type="time">` nativos del modal de detalle de parte de Admin y cambiarlos por una solución controlable (por ejemplo, selects HH:MM) para evitar incoherencias visuales en iOS/Safari.
 *   **Limpieza Barra Superior Admin**: Retirar `QR Codes` del array de `TABS` de navegación y ajustar el flex/grid final para que `Dashboard` quede firmemente centrado.
 *   **Limpieza de UI Desktop**: El Admin panel ha sido optimizado brutalmente en mobile-first. Una revisión visual (max-widths o paddings expansivos) podría requerirse si este se transiciona a una pantalla Mac/Tablet en exclusiva.
+*   **Migración `GET /admin/dashboard` a Supabase (Segunda Fase)**: El dashboard sigue leyendo `PartesLimpieza` desde Sheets. Puede mostrar datos desincronizados respecto a ediciones/cierres hechos vía admin (que ya solo actualizan Supabase). Pendiente de migrar en segunda fase.
 *   **Saltos Evolutivos PMS / PostgreSQL (V2.5)**: Queda mapeada la posibilidad de romper Google Sheets cuando el tráfico mensual desborde cuotas de lectura / escritura o para simplificar consultas GROUP_BY temporales ineficientes en .js puro.
 
 ------------------------------------------------------------

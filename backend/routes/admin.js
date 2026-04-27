@@ -4,11 +4,27 @@ const { requireAuth, requireAdmin } = require('../middleware/auth');
 const sheets = require('../services/sheets');
 const tg = require('../services/telegram');
 const syncGratal = require('../jobs/syncGratal');
-// NOTA: NO importamos desde './partes' para evitar carga doble de servicios.
-// Las funciones helper necesarias se definen aquí directamente.
 const { now, today, getMadridParts } = require('../services/time');
 
+const { createClient } = require('@supabase/supabase-js');
+const supabase = (() => {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!url || !key) { console.error('[ADMIN] Supabase no configurado'); return null; }
+    return createClient(url, key, { auth: { persistSession: false } });
+})();
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+function _safeJsonArr(v) {
+    if (Array.isArray(v)) return v;
+    try { return JSON.parse(v || '[]'); } catch { return []; }
+}
+function nextMonthStart(mes) {
+    const [y, m] = mes.split('-').map(Number);
+    const nm = m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, '0')}`;
+    return `${nm}-01`;
+}
+
 function diffMin(ts1, ts2) {
     const ms = (ts2 ? new Date(ts2) : new Date()) - new Date(ts1);
     return Math.max(0, Math.round(ms / 60000));
@@ -29,8 +45,7 @@ function getTiempoLegacySegAdmin(fila) {
     if (!fila.inicio_ts) return 0;
     const fin = fila.fin_ts || now();
     let totalSeg = segEntre(fila.inicio_ts, fin);
-    let pausas = [];
-    try { pausas = JSON.parse(fila.pausas_json || '[]'); } catch { }
+    const pausas = _safeJsonArr(fila.pausas_json);
     for (const p of pausas) {
         const pFin = p.fin || fin;
         totalSeg -= segEntre(p.inicio, pFin);
@@ -93,8 +108,7 @@ function formToMadridISO(fecha, hora) {
 // Si el parte estaba ABIERTO, suma el tramo activo hasta finTs.
 // Si estaba PAUSADO, usa el acumulado congelado.
 function calcTiempoEfectivo(fila, finTs) {
-    let pausas = [];
-    try { pausas = JSON.parse(fila.pausas_json || '[]'); } catch { /* ignorar */ }
+    const pausas = _safeJsonArr(fila.pausas_json);
     const last = pausas[pausas.length - 1];
     if (last && !last.fin) last.fin = finTs;
     const acum = getTiempoAcumuladoSeg(fila);
@@ -576,13 +590,19 @@ router.patch('/usuarios/:id/pin', requireAuth, requireAdmin, async (req, res, ne
 // ─── GET /api/admin/resumen-mensual ──────────────────────────────────────────
 router.get('/resumen-mensual', requireAuth, requireAdmin, async (req, res, next) => {
     try {
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
         const mes = req.query.mes || today().slice(0, 7);
-        const partesReq = await sheets.readSheetAsObjects('PartesLimpieza');
-        const partes = partesReq.filter(p => String(p.status).toUpperCase() !== 'ANULADO');
-        const mesParts = partes.filter(p => p.fecha?.startsWith(mes));
+
+        const { data, error } = await supabase
+            .from('partes_limpieza')
+            .select('user_id, usuario_nombre, fecha, duracion_min, coste_estimado_eur, status')
+            .neq('status', 'ANULADO')
+            .gte('fecha', `${mes}-01`)
+            .lt('fecha', nextMonthStart(mes));
+        if (error) return next(error);
 
         const resumen = {};
-        mesParts.forEach(p => {
+        (data || []).forEach(p => {
             const k = p.user_id || p.usuario_nombre;
             if (!resumen[k]) resumen[k] = { nombre: p.usuario_nombre, minutos: 0, coste: 0 };
             resumen[k].minutos += parseInt(p.duracion_min || 0);
@@ -601,17 +621,22 @@ router.get('/resumen-mensual', requireAuth, requireAdmin, async (req, res, next)
 // ─── GET /api/admin/partes-abiertos ─────────────────────────────────────────
 router.get('/partes-abiertos', requireAuth, requireAdmin, async (req, res, next) => {
     try {
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const abiertos = rows
-            .filter(r => String(r.status).toUpperCase() !== 'ANULADO' && !r.fin_ts && r.inicio_ts)
-            .map(r => {
-                const { _row, ...safe } = r;
-                safe.duracion_actual_min = diffMin(r.inicio_ts, null);
-                safe.tiempo_efectivo_seg = getTiempoActualSegAdmin(r);
-                safe.tiempo_acumulado_seg = getTiempoAcumuladoSeg(r);
-                
-                return safe;
-            });
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const { data, error } = await supabase
+            .from('partes_limpieza')
+            .select('*')
+            .is('fin_ts', null)
+            .neq('status', 'ANULADO')
+            .order('inicio_ts', { ascending: false });
+        if (error) return next(error);
+        const abiertos = (data || [])
+            .filter(r => r.inicio_ts)
+            .map(r => ({
+                ...r,
+                duracion_actual_min: diffMin(r.inicio_ts, null),
+                tiempo_efectivo_seg: getTiempoActualSegAdmin(r),
+                tiempo_acumulado_seg: getTiempoAcumuladoSeg(r),
+            }));
         res.json(abiertos);
     } catch (err) { next(err); }
 });
@@ -626,10 +651,11 @@ router.post('/partes/:id/cerrar', requireAuth, requireAdmin, async (req, res, ne
         const admin = req.session.user;
 
         if (!motivo?.trim()) return res.status(400).json({ error: 'El motivo es obligatorio' });
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
 
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = rows.find(r => r.id === id);
-        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
+        const { data: fila, error: selErr } = await supabase
+            .from('partes_limpieza').select('*').eq('id', id).single();
+        if (selErr || !fila) return res.status(404).json({ error: 'Parte no encontrado' });
         if (fila.fin_ts) return res.status(409).json({ error: 'Parte ya cerrado' });
 
         const nowTs = now();
@@ -643,30 +669,27 @@ router.post('/partes/:id/cerrar', requireAuth, requireAdmin, async (req, res, ne
 
         // Calcular tiempo efectivo respetando pausas registradas
         const { tiempoEfectivoMin, tiempoAcumuladoSeg, pausasJsonFinal } = calcTiempoEfectivo(fila, finFinal);
-        const durMin = diffMin(fila.inicio_ts, finFinal); // duración total (con pausas incluidas)
-        const coste = calcCoste(tiempoEfectivoMin); // coste sobre tiempo efectivo
+        const durMin = diffMin(fila.inicio_ts, finFinal);
+        const coste = calcCoste(tiempoEfectivoMin);
 
-        const nuevaFila = buildParteRow({
-            ...fila,
+        const { error: updErr } = await supabase.from('partes_limpieza').update({
             fin_ts: finFinal,
-            duracion_min: String(durMin),
-            coste_estimado_eur: coste,
+            duracion_min: durMin,
+            coste_estimado_eur: parseFloat(coste),
             resumen: fila.resumen || 'Cerrado manualmente por admin',
-            pausas_json: pausasJsonFinal,
-            tiempo_efectivo_min: String(tiempoEfectivoMin),
-            tiempo_acumulado_seg: String(tiempoAcumuladoSeg),
-            ultimo_reanudar_ts: '',
+            pausas_json: _safeJsonArr(pausasJsonFinal),
+            tiempo_efectivo_min: tiempoEfectivoMin,
+            tiempo_acumulado_seg: tiempoAcumuladoSeg,
+            ultimo_reanudar_ts: null,
             status: 'CERRADO_FORZADO',
-            // Auditoría
-            admin_editado: 'true',
+            admin_editado: true,
             admin_editado_por: admin.user_id || admin.nombre,
             admin_editado_ts: nowTs,
             admin_edit_motivo: motivo.trim(),
             inicio_ts_original: fila.inicio_ts_original || fila.inicio_ts,
-            fin_ts_original: fila.fin_ts_original || '',
-        });
-
-        await sheets.updateRow('PartesLimpieza', fila._row, nuevaFila);
+            fin_ts_original: fila.fin_ts_original || null,
+        }).eq('id', id);
+        if (updErr) return next(updErr);
 
         tg.enviarMensaje(
             `🔴 Parte cerrado por admin\n` +
@@ -699,31 +722,30 @@ router.post('/partes/:id/editar-horas', requireAuth, requireAdmin, async (req, r
         if (finNew && new Date(finNew) > new Date(Date.now() + 86400000))
             return res.status(400).json({ error: 'fin_ts no puede ser absurdamente en el futuro (+24h)' });
 
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = rows.find(r => r.id === id);
-        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const { data: fila, error: selErr } = await supabase
+            .from('partes_limpieza').select('*').eq('id', id).single();
+        if (selErr || !fila) return res.status(404).json({ error: 'Parte no encontrado' });
 
         const nowTs = now();
-        const durMin = finNew ? diffMin(inicioNew, finNew) : (parseInt(fila.duracion_min) || '');
-        const coste = finNew ? calcCoste(durMin) : (fila.coste_estimado_eur || '');
+        const durMin = finNew ? diffMin(inicioNew, finNew) : (parseInt(fila.duracion_min) || null);
+        const coste = finNew ? parseFloat(calcCoste(durMin)) : (parseFloat(fila.coste_estimado_eur) || null);
 
-        // Usar buildParteRow (42 cols) — preserva tiempo_acumulado_seg, ultimo_reanudar_ts, tareas_periodicas_json
-        const nuevaFila = buildParteRow({
-            ...fila,
+        const { error: updErr } = await supabase.from('partes_limpieza').update({
             inicio_ts: inicioNew,
-            fin_ts: finNew !== undefined ? finNew : fila.fin_ts,
-            duracion_min: String(durMin),
-            coste_estimado_eur: String(coste),
+            fin_ts: finNew !== undefined ? (finNew || null) : fila.fin_ts,
+            duracion_min: durMin,
+            coste_estimado_eur: coste,
             status: fila.status || (finNew ? 'CERRADO' : 'ABIERTO'),
-            admin_editado: 'true',
+            admin_editado: true,
             admin_editado_por: admin.user_id || admin.nombre,
             admin_editado_ts: nowTs,
             admin_edit_motivo: motivo.trim(),
             inicio_ts_original: fila.inicio_ts_original || fila.inicio_ts,
-            fin_ts_original: fila.fin_ts_original || (fila.fin_ts || ''),
-        });
+            fin_ts_original: fila.fin_ts_original || fila.fin_ts || null,
+        }).eq('id', id);
+        if (updErr) return next(updErr);
 
-        await sheets.updateRow('PartesLimpieza', fila._row, nuevaFila);
         res.json({ ok: true, inicio_ts: inicioNew, fin_ts: finNew, duracion_min: durMin, coste });
     } catch (err) { next(err); }
 });
@@ -742,31 +764,28 @@ router.patch('/partes/:id/ajustar-tiempo', requireAuth, requireAdmin, async (req
         if (isNaN(minutos) || minutos < 0)
             return res.status(400).json({ error: 'tiempo_efectivo_min debe ser un número >= 0' });
 
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = rows.find(r => r.id === id);
-        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const { data: fila, error: selErr } = await supabase
+            .from('partes_limpieza').select('id, admin_edit_motivo, inicio_ts, fin_ts, inicio_ts_original, fin_ts_original').eq('id', id).single();
+        if (selErr || !fila) return res.status(404).json({ error: 'Parte no encontrado' });
 
         const nowTs = now();
-        // Recalcular coste basado en tiempo efectivo ajustado
         const costeAjustado = calcCoste(minutos);
 
-        const nuevaFila = buildParteRow({
-            ...fila,
-            tiempo_efectivo_min: String(minutos),
-            coste_estimado_eur: costeAjustado,
-            // Auditoría
-            admin_editado: 'true',
+        const { error: updErr } = await supabase.from('partes_limpieza').update({
+            tiempo_efectivo_min: minutos,
+            coste_estimado_eur: parseFloat(costeAjustado),
+            admin_editado: true,
             admin_editado_por: admin.user_id || admin.nombre,
             admin_editado_ts: nowTs,
-            // Motivo: acumular si ya había uno anterior
             admin_edit_motivo: fila.admin_edit_motivo
                 ? `${fila.admin_edit_motivo} | [tiempo] ${motivo.trim()}`
                 : `[tiempo] ${motivo.trim()}`,
             inicio_ts_original: fila.inicio_ts_original || fila.inicio_ts,
-            fin_ts_original: fila.fin_ts_original || (fila.fin_ts || ''),
-        });
+            fin_ts_original: fila.fin_ts_original || fila.fin_ts || null,
+        }).eq('id', id);
+        if (updErr) return next(updErr);
 
-        await sheets.updateRow('PartesLimpieza', fila._row, nuevaFila);
         res.json({ ok: true, tiempo_efectivo_min: minutos, coste_estimado_eur: costeAjustado });
     } catch (err) { next(err); }
 });
@@ -779,24 +798,22 @@ router.post('/partes/:id/anular', requireAuth, requireAdmin, async (req, res, ne
         const admin = req.session.user;
 
         if (!motivo?.trim()) return res.status(400).json({ error: 'El motivo es obligatorio' });
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
 
-        const rows = await sheets.readSheetAsObjects('PartesLimpieza');
-        const fila = rows.find(r => r.id === id);
-        if (!fila) return res.status(404).json({ error: 'Parte no encontrado' });
+        const { data: fila, error: selErr } = await supabase
+            .from('partes_limpieza').select('id, admin_edit_motivo, usuario_nombre, casa, tipo_limpieza, inicio_ts').eq('id', id).single();
+        if (selErr || !fila) return res.status(404).json({ error: 'Parte no encontrado' });
 
-        const nuevaFila = buildParteRow({
-            ...fila,
+        const { error: updErr } = await supabase.from('partes_limpieza').update({
             status: 'ANULADO',
-            admin_editado: 'true',
+            admin_editado: true,
             admin_editado_por: admin.user_id || admin.nombre,
             admin_editado_ts: now(),
-            // Preservamos el motivo acumulado si lo hubiera
             admin_edit_motivo: fila.admin_edit_motivo
                 ? `${fila.admin_edit_motivo} | [ANULADO] ${motivo.trim()}`
-                : `[ANULADO] ${motivo.trim()}`
-        });
-
-        await sheets.updateRow('PartesLimpieza', fila._row, nuevaFila);
+                : `[ANULADO] ${motivo.trim()}`,
+        }).eq('id', id);
+        if (updErr) return next(updErr);
 
         tg.enviarMensaje(
             `❌ Parte ANULADO por admin\n` +
@@ -1089,16 +1106,41 @@ router.post('/partes/manual', requireAuth, requireAdmin, async (req, res, next) 
             created_by: adminUser.nombre
         };
 
-        // 5. Guardar en Sheets 
-        // Usamos appendRow + buildParteRow para garantizar que mandamos exactamente 42 columnas (A-AP)
-        // Bypasseamos appendRowAsObject porque intenta añadir cabeceras si sobran campos.
-        const rowValues = buildParteRow(manualData);
-        await sheets.appendRow('PartesLimpieza', rowValues);
+        // 5a. Guardar en Supabase (primario)
+        if (!supabase) return res.status(500).json({ error: 'Base de datos no disponible' });
+        const { error: insErr } = await supabase.from('partes_limpieza').insert({
+            id: idManual,
+            session_id: idManual,
+            cleaning_session_id: manualData.cleaning_session_id,
+            fecha,
+            casa,
+            tipo_limpieza: manualData.tipo_limpieza,
+            inicio_ts,
+            fin_ts,
+            duracion_min: durMin,
+            tiempo_efectivo_min: durMin,
+            tiempo_acumulado_seg: durMin * 60,
+            ultimo_reanudar_ts: null,
+            user_id,
+            usuario_nombre: nombreWorker,
+            coste_estimado_eur: parseFloat(coste),
+            status: 'CERRADO',
+            admin_editado: true,
+            admin_editado_por: adminUser.nombre,
+            admin_editado_ts: manualData.admin_editado_ts,
+            admin_edit_motivo: manualData.admin_edit_motivo,
+            casa_lista: manualData.casa_lista,
+            tareas_realizadas: tareas_realizadas || null,
+            observaciones: observaciones || null,
+            created_by: adminUser.nombre,
+            pausas_json: [],
+        });
+        if (insErr) return next(insErr);
 
-        // 6. Actualizar resumen mensual (opcional pero recomendado para consistencia inmediata)
-        const mesStr = fecha.slice(0, 7);
-        const allPartes = await sheets.readSheetAsObjects('PartesLimpieza');
-        await upsertResumenMensual(mesStr, allPartes);
+        // 5b. Backup en Sheets (no bloquea la respuesta si falla)
+        sheets.appendRow('PartesLimpieza', buildParteRow(manualData)).catch(e =>
+            console.error('[partes/manual] Error backup Sheets:', e.message)
+        );
 
         res.json({ ok: true, id: idManual, duracion_min: durMin, coste_estimado_eur: coste });
     } catch (err) {
